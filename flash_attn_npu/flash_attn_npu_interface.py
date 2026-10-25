@@ -1156,8 +1156,20 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             and tuple(window_size) == (-1, -1)
             and all(x.is_contiguous() for x in (q, k, v))
         )
+        # Plain eager TND derives task counts from the current prefix in the
+        # kernel. Keep public metadata, tracing/modes, paging and extras intact.
+        plain_varlen = (
+            not short_vector
+            and block_table is None
+            and dropout_p == 0.0
+            and softcap == 0.0
+            and alibi_slopes is None
+            and tuple(window_size) == (-1, -1)
+            and _use_eager_varlen_impl((q, k, v, cu_seqlens_q, cu_seqlens_k), {})
+            and not torch.npu.is_current_stream_capturing()
+        )
         scheduler_metadata = None
-        if not short_vector:
+        if not short_vector and not plain_varlen:
             cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             if alibi_slopes is None:
                 alibi_slopes_batch_stride = 0
@@ -1180,7 +1192,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 softmax_scale=softmax_scale,
                 alibi_slopes_batch_stride=alibi_slopes_batch_stride,
             )
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
+        # plain_varlen already checked the tensor types and transformation
+        # modes; no metadata operation intervenes that could change them.
+        forward_impl = (
+            _flash_attn_varlen_forward_impl if plain_varlen else _wrapped_flash_attn_varlen_forward
+        )
+        out_padded, softmax_lse, S_dmask, rng_state = forward_impl(
             q,
             k,
             v,

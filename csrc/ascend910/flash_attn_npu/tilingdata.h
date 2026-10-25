@@ -7,6 +7,10 @@
 #ifndef FLASH_ATTENTION_REGULAR_H
 #define FLASH_ATTENTION_REGULAR_H
 
+// Internal-only marker in existing padding; no metadata layout/size change.
+// Public metadata producers zero this field and keep their original scheduling.
+constexpr uint32_t FA_DYNAMIC_Q_TASKS = 0x51445331U;
+
 struct coreNode {
     int startBIdx;
     int startN1Idx;

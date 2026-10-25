@@ -8,6 +8,7 @@
 #define __CUBEAddr_H__
 
 #include "common_header.h"
+#include "head_skip.hpp"
 
 template<MaskType maskType, InputLayout inputLayout>
 class CubeAddr {
@@ -95,8 +96,22 @@ public:
         globalCubeAddr = cubeAddrInfo;
         globalCubeAddr->blockLength = 0;
 
-        int32_t loopCnt = 0;
+        // This call stays within one round of coreNum consecutive segments.
+        // Comparing its target segment avoids a modulo for every rectangle.
+        const int32_t targetSegment = (roundId - 1) * coreNum + coreId;
         while (overFlag) {
+            if (SkipUnownedHeads<maskType>(*this, targetSegment)) {
+                // Complete-head skips preserve the existing segment boundary.
+                if (blockNum >= 15) {
+                    ++coreSegmentBlockNum;
+                    SegmentBlockNum = 0;
+                    blockNum = 0;
+                    if (coreSegmentBlockNum == roundId * coreNum) {
+                        break;
+                    }
+                }
+                continue;
+            }
             // NO_MASK: full S1xS2 rectangle; CAUSAL: lower-triangular workspace footprint.
             int32_t guardLen;
             if constexpr (maskType == MaskType::NO_MASK) {
@@ -115,7 +130,7 @@ public:
                 realLenAlign = (reserve + s1GuardInterval - 1) / s1GuardInterval;
             }
             if (realLenAlign >= guardLen) {
-                if (coreSegmentBlockNum % coreNum == coreId) {
+                if (coreSegmentBlockNum == targetSegment) {
                     int32_t index = globalCubeAddr->blockLength;
                     globalCubeAddr->addrInfo[index].left = getLeftAddr(batchIdx, nheadsIdx, qSeqlen, qSeqIdx, headdim);
                     globalCubeAddr->addrInfo[index].right = getRightAddr(batchIdx, nheadsIdx, kSeqlen, seqKIdx,
@@ -146,7 +161,7 @@ public:
                 }
             } else {
                 int32_t realLen = (reserve / s1GuardInterval);
-                if (coreSegmentBlockNum % coreNum == coreId) {
+                if (coreSegmentBlockNum == targetSegment) {
                     int32_t index = globalCubeAddr->blockLength;
                     globalCubeAddr->addrInfo[index].left = getLeftAddr(batchIdx, nheadsIdx, qSeqlen, qSeqIdx, headdim);
                     globalCubeAddr->addrInfo[index].right = getRightAddr(batchIdx, nheadsIdx, kSeqlen, seqKIdx,

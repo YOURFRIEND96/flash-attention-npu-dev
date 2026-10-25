@@ -327,6 +327,26 @@ class FAInferKernel {
         embedRoundV = RoundUp(embedV, FaiKenel::BLOCK_SIZE);
         groupSize = qHeads / kvHeads;
 
+        if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND && !PAGED_CACHE_FLAG) {
+            if (fATilingData->padding3 == FA_DYNAMIC_Q_TASKS) {
+                // Preserve the existing task order/drain with counts derived
+                // from every actual batch, including empty and ragged batches.
+                totalTaskNum = 0;
+                firstBatchTaskNum = 0;
+                uint32_t prevQ = static_cast<uint32_t>(gActualQseqlen.GetValue(0));
+                for (uint32_t b = 0; b < batch; ++b) {
+                    const uint32_t nextQ = static_cast<uint32_t>(gActualQseqlen.GetValue(b + 1));
+                    const uint32_t qLen = nextQ - prevQ;
+                    const uint32_t headBlocks = CeilDiv(groupSize, GetQNBlockTile(qLen, groupSize)) * kvHeads;
+                    const uint32_t qBlocks = CeilDiv(qLen, GetQSBlockTile(maxKvSeqlen, groupSize, qLen));
+                    const uint32_t tasks = headBlocks * qBlocks;
+                    if (b == 0) firstBatchTaskNum = tasks;
+                    totalTaskNum += tasks;
+                    prevQ = nextQ;
+                }
+            }
+        }
+
         totalQTokens = 0;
         if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
             totalQTokens = static_cast<uint32_t>(gActualQseqlen.GetValue(batch));

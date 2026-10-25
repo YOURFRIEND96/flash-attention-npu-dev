@@ -108,12 +108,9 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
 
     __aicore__ inline void SetMask(int32_t len)
     {
-        uint64_t mask = 0;
-        uint64_t one = 1;
-        uint64_t temp = static_cast<uint64_t>(len) % static_cast<uint64_t>(FLOAT_VECTOR_SIZE);
-        for (uint64_t i = 0; i < temp; i++) {
-            mask |= one << i;
-        }
+        const uint64_t temp = static_cast<uint64_t>(len) % static_cast<uint64_t>(FLOAT_VECTOR_SIZE);
+        // temp is in [0, 63], including the empty low-bit mask at zero.
+        const uint64_t mask = (uint64_t{1} << temp) - 1;
 
         if (len == VECTOR_SIZE) {
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);

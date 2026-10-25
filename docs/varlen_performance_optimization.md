@@ -6,7 +6,7 @@
 - 对照为同一台 Ascend910_9362、同一卡上的 `torch_npu.npu_fusion_attention`，CANN 9.2.0。
 - 保持公开 `flash_attn_varlen_func` 前反向语义；不把调用 CANN 算子作为本项目 kernel 的性能优化。
 - 主指标沿用已有 eager NPU Event 时间，分别统计前向、反向、前向+反向。预热 10 次，每轮 50 次，5 轮取中位数。该时间包含提交间隙，不等于纯 kernel 时间。
-- 最新验收口径（用户2026-10-25补充）：允许平均性能持平，优先通用优化，避免TND各batch等长等特化。按10组加速比的等权几何平均分别报告F/B/F+B，平均Flash耗时倍率不超过CANN的1.05倍作为测量容差；同时报告算术平均、累计耗时比和逐场景结果，明确保留退化项。早期日志的“逐项5%”结论保留为历史记录。
+- 最新验收口径（用户2026-10-25继续优化时明确）：以每组前反向总耗时验收，加速比CANN/Flash不低于0.9×，争取1.0×持平（等价Flash总耗时不超过CANN的1/0.9≈1.111倍）。前向/反向分项用于定位，继续报告全部10组均值与累计耗时比。保持通用优化、禁止TND各batch等长假设；此前平均5%及逐项5%口径保留为历史记录。
 - 精度仍采用仓库的 FP32/低精度双参考规则，检查完整 out/dQ/dK/dV。任何精度失败的性能结果只用于诊断。
 - 数据、seed=2026、scale、mask、真实累计长度、dtype 和计时范围保持一致。T5 长度为满足表格总 token 数及最大长度的固定合成分布，完整值保存在报告 JSON。
 
@@ -60,7 +60,7 @@
 
 这些设计以本地ops-transformer源码作为参考，以实际安装CANN的同轮测量作为性能对照，两者版本不应视作完全相同。
 
-## E35最终代码取舍（已验证）
+## E35检查点代码取舍（历史基线）
 
 | 优化点 | 当前状态 | 泛化与验证边界 |
 |---|---|---|
@@ -223,7 +223,7 @@ FLASH_ATTN_BUILD_VERSION=v2 FLASH_ATTN_BUILD_NPU=910 /tmp/fa-benchmark-venv/bin/
 
 - E34兼容性回归：212项全部通过（269.38秒），包含原201项以及11项KV cache split/append/GQA尾块、分页SWA和无效前缀回归；日志`../../benchmark_results/perf_e34/validation/regression.log`。benchmark统计工具7项CPU单测通过。随后完整10组精度也通过，E34平均指标见上文；最终交付以E35结果为准。
 
-## E35最终结果与当前状态
+## E35检查点结果
 
 最终报告：[完整精度与性能](../../benchmark_results/perf_e35/results.md)，[JSON与原始计时样本](../../benchmark_results/perf_e35/results.json)。同一构建版本、NPU 1、无并行编译；10/10组out/dQ/dK/dV双参考检查全部通过，214项兼容性回归通过（261.84秒），统计工具7项CPU单测通过。源码、native SHA256、构建日志及可复现回归命令归档于[validation](../../benchmark_results/perf_e35/validation/)。最终核对实现和二进制哈希均未变化。
 
@@ -235,7 +235,7 @@ FLASH_ATTN_BUILD_VERSION=v2 FLASH_ATTN_BUILD_NPU=910 /tmp/fa-benchmark-venv/bin/
 | 反向 | 1.01608× | 1.02798× | 1.02119× | 6/10 |
 | 前反向 | 1.02350× | 1.05073× | 1.00611× | 6/10 |
 
-满足用户最新允许的平均性能持平目标。前反向累计时间仅减少约0.61%；前向累计时间仍比CANN多约4.40%。Decoder的优势对均值贡献明显，不能把平均达标解释为逐场景全部达标：Qwen四组的三个阶段仍慢于CANN，Cross前向仍有差距。完整表保留所有逐项结果。
+满足当时用户允许的平均性能持平目标；后续验收改为逐组F+B≥0.9×，见E39。前反向累计时间仅减少约0.61%；前向累计时间仍比CANN多约4.40%。Decoder的优势对均值贡献明显，不能把平均达标解释为逐场景全部达标：Qwen四组的三个阶段仍慢于CANN，Cross前向仍有差距。完整表保留所有逐项结果。
 
 E35撤回对照：Encoder FP16前向从E34的3477.7μs降至2572.5μs；Cross FP16从3557.3μs降至2574.5μs。两轮均采用完整精度及相同计时流程，但仍存在地址/系统波动，不能据一次对照断言唯一硬件原因。没有证据支持保留QK预取的复杂度，最终恢复原QK文件。新增的MHA路由保护不改变这10组输入的路由，并通过两项129-batch非等长GQA回归。
 
@@ -243,3 +243,56 @@ E35撤回对照：Encoder FP16前向从E34的3477.7μs降至2572.5μs；Cross FP
 
 P09的PV等待位置调整、P10的L2 hint等仍是未实施假设，已记录而未加入最终版本；没有用未经验证的指令改动填充优化项。
 
+
+## E36起：检查点之后的通用优化
+
+- 已按用户要求将E35提交为Git检查点`4fabafb`。提交前核对实现与已验收SHA256一致；提交包含29文件、精度修复、通用优化、基准/诊断脚本、回归与实验记录。仓库未配置作者，单次提交使用Codex身份，未改变全局Git配置。
+- E36（编译中）：前向kernel只在同一次launch内复用当前batch实际读取的Q/K prefix及长度，batch变化即刷新；不推导等长、不跨调用缓存用户数据。任务扫描中的KV读取从未被GetQSBlockTile使用，移除该冗余读取。
+- E36：SetVecMask/SetMask将逐位构造掩码改为低位移位公式，保留len=0/64/128语义；2个函数×129个合法长度，258项CPU穷举等价检查通过。
+- E36：PV去掉独立V-ready的MTE2→MTE1 Set/Wait。后续第一个P-ready事件覆盖同一MTE2流水中全部前序V搬运，并在第一次V的L1→L0B消费前等待；V槽复用EVENT_ID4、P/K槽与L0依赖保留。AscendC SetFlag_WaitFlag_ISASI文档支持该顺序依赖；WaitFlag仅阻塞目的流水，故不能未测即宣称大幅重叠收益。分页/append/空行仍须回归。
+
+- E36结果：71项短Q/空行/GQA/分页/append/SWA回归全部通过（131.49秒）。10组诊断计时见`../../benchmark_results/perf_e36/timings.json`，仍标记accuracy=not_checked。Qwen四组F+B约1270.9/1186.3/1564.7/1572.5μs，无达标证据；当前分核下很多核每个任务即切换batch，同batch缓存利用不足。撤回当前batch缓存及对应扫描改动，避免保留未证实收益的状态复杂度；P09和两处掩码公式继续随E37验证，不能把组合实验当作各自独立提速证据。
+- E37（编译中）：优化反向任务扫描。在本轮非本核segment的head起点，只有完整head的真实tile数能装入15-tile flush边界前才跳过；最后一个head仍走原batch切换路径。NO_MASK按s1×s2计数，causal按三角tile数计数，int64计算；Cube/Vector共用helper，原workspace位置、矩形划分、原子加顺序和round边界保持。每轮owner判断改为与预计算targetSegment比较，替代逐矩形动态取模。
+- E37 CPU模型：8,393组配置穷举/随机检查每轮Cube矩形、Vector坐标、overFlag与游标状态完全一致，同时逐步验证targetSegment比较与取模等价。模拟扫描循环减少Qwen3B48.3%、4B55.1%、混合变长25.7%，不是NPU速度收益；实际精度/总耗时待测。
+
+- E37完整结果：214项回归通过（260.81秒），10/10完整精度通过。Qwen3B FP16/BF16 F+B加速比0.884×/0.871×，4B0.883×/0.897×，尚未满足最新0.9×逐组目标；Encoder1.022×/1.011×、Decoder2.052×/2.025×、Cross1.032×/1.021×均通过。F+B几何平均1.10683×、累计耗时比1.03747×。原始报告`../../benchmark_results/perf_e37/results.md`。保留通用反向扫描优化，尤其Decoder完整结果明显改善；不将组合实验解释为P09/掩码公式各自独立收益。
+- E38（编译中）：普通eager TND、非分页、无dropout/softcap/ALiBi/local时，复用仅含标量配置的immutable tiling。每次kernel从真实Q prefix计算任务总数，沿用原分核、batch游标与最后排空；不缓存实际长度/指针，不假定等长。cache最多16项、按device和所有标量配置区分，首次H2D完成后发布，每次recordStream保护生命周期。省去该路径每次AICPU metadata及用于准备的Sub；公开metadata、显式metadata、compile/mode/capture与额外功能维持原路径。
+- E38兼容性设计：在现有padding3使用明确magic，结构大小不变；原Host/AICPU producer完整清零，该标记仅内部TND读取。actual K长度仍在runMainLoop覆盖maxK上界，用于右对齐causal和空行判断。每核新增O(B) prefix扫描有成本，是否获益必须实测。新增4项prefix原地修改/跨stream测试，同一存储与标量key切换非等长、空序列、Q/K不同及128/129、512/513分块边界，校验out/dQ/dK/dV/LSE。
+
+- E38首次加载失败（尚未执行NPU精度）：torch_npu头文件的inline currentStreamCaptureStatus引用动态库未导出的CheckCompatibleImpl。通过nm核对本机libtorch_npu导出的currentStreamCaptureStatusMayInitCtx，改用该接口；此时已有真实NPU输入，device context已存在。构建成功不代表扩展可加载，该失败日志独立归档为import_failed.log，重新构建后验证。
+
+- E38回归到163项通过时，旧metadata spy断言失败（期望普通TND每次调用一次AICPU，实际0次），不是数值失败。将原metadata用例显式切到保留的registered-op路线，继续保留一次调用及全部数值断言；新增4项测试则禁止调用AICPU metadata，证明实际覆盖新路径。未修改生产实现或精度规则，重跑受影响的4项及全部48项metadata、11项KV/SWA，共63项；此前155项其余回归无需重复。
+
+- E38完整结果：218项回归分批覆盖通过（155项未受metadata断言修改影响，随后4+48+11=63项通过）；10/10双参考精度通过。F+B加速比依次为3B0.89872×/0.90990×、4B0.93426×/0.97072×、Encoder0.95150×/0.96983×、Decoder1.93896×/1.93668×、Cross0.94241×/0.93969×。9/10达到0.9×，3B FP16不能用四舍五入冒充达标。报告`../../benchmark_results/perf_e38/results.md`。
+- E38元数据规模诊断：`../../benchmark_results/metadata_planning_e38/`，相同输入/相同native调用、AB/BA交替计时、5预热20次3轮；B16/32/64/128/256/512，真实长度混合129/257/279，另测短Q混合0..4。causal/full/short共18组设备规划均更快，B512优势仅约0.3%–2.4%；两路线out/LSE逐元素相同，但此诊断不替代独立精度。结果不支持将完整benchmark中Encoder/Cross变慢简单归因于O(B)扫描，更不能据此直接加入固定batch阈值；最终暂不增加此门槛。原始脚本与样本保留。
+- E39（Python改动）：plain_varlen已经确认全部实际Tensor输入及变换模式，且其后未执行metadata操作，直接复用该判断调用同一个native wrapper，省去外层wrapped函数重复扫描类型/模式。不改变native二进制、数学计算、任务分配或缓存范围；公开op和非plain路径仍走原分发。复测4项动态prefix、2项dispatch、3项compile、3项metadata，并重新运行10组完整验收。
+
+## E39最终验收与当前保留实现
+
+[前反向验收表](../../benchmark_results/perf_e39/acceptance.md)、[完整精度/三阶段报告](../../benchmark_results/perf_e39/results.md)、[原始样本与版本哈希](../../benchmark_results/perf_e39/results.json)。10/10组out/dQ/dK/dV双参考检查通过，逐组CANN/Flash F+B均不低于0.9×；最低0.91298×，不是以平均值替代逐组验收。
+
+| 场景 | 精度 | Flash μs | CANN μs | CANN / Flash | ≥0.9× |
+|---|---|---:|---:|---:|---|
+| Qwen3 3B | fp16 | 1060.4 | 968.1 | 0.91298× | PASS |
+| Qwen3 3B | bf16 | 1046.8 | 960.4 | 0.91744× | PASS |
+| Qwen3 4B | fp16 | 1406.3 | 1309.0 | 0.93078× | PASS |
+| Qwen3 4B | bf16 | 1363.0 | 1303.7 | 0.95650× | PASS |
+| T5 Encoder | fp16 | 14863.7 | 14351.6 | 0.96554× | PASS |
+| T5 Encoder | bf16 | 15283.2 | 14997.1 | 0.98128× | PASS |
+| T5 Decoder | fp16 | 831.7 | 1667.8 | 2.00532× | PASS |
+| T5 Decoder | bf16 | 834.7 | 1673.0 | 2.00424× | PASS |
+| T5 Cross | fp16 | 12138.3 | 11682.1 | 0.96242× | PASS |
+| T5 Cross | bf16 | 12621.7 | 11708.4 | 0.92764× | PASS |
+
+F+B等权几何平均1.09749×、算术平均1.15641×、累计耗时比0.98651×。因此累计耗时仍比CANN多约1.37%；Decoder优势明显，Qwen尚未全面持平。Encoder/Cross比E37慢的差异如实保留；18组同输入诊断未支持将其唯一归因于prefix扫描，也没有据此添加固定batch阈值。
+
+验证覆盖：E38的218项不同回归已分批通过（155项未变测试及随后63项），E39仅改Python重复分发判断，相关12项再次通过（40.72秒），随后重新完成全部10组独立精度及性能。无新增误差容差、无筛除慢项、无将Flash替换为CANN。最终实现与二进制SHA256核对一致，日志、源码快照与可复现run.sh均在`perf_e39/validation/`。
+
+相对Git检查点4fabafb最终保留：
+
+- E37通用反向head扫描跳过及每轮owner比较；按真实tile数和workspace容量判断，不固定S或batch。
+- 两处Vector mask构造闭式替换；PV依赖由后续P-ready覆盖，保留全部槽复用保护。
+- E38普通eager TND仅标量immutable tiling复用，实际prefix每次重新读取，取消该路径每次AICPU metadata与Sub准备；其余功能/公开metadata保留原路由。
+- E39复用已经完成的eager判断，避免重复分发检查。
+
+已撤回/未加入：E36当前batch prefix缓存未显示Qwen收益，已撤回；相邻任务二元分块只完成CPU调度检查，未在NPU实测，未加入；batch/prefix预算分支没有足够性能依据，未加入。所有当前路径继续支持非等长TND，新增同一prefix张量原地变更和跨stream回归通过。

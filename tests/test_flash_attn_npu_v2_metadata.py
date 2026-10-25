@@ -384,8 +384,12 @@ def test_flash_attn_kvcache_metadata_num_splits_mismatch_rejected():
 )
 def test_flash_attn_varlen_func_metadata_tnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
-    metadata_spy,
+    metadata_spy, monkeypatch,
 ):
+    # Exercise the retained registered-op metadata route explicitly. Plain
+    # eager TND now derives task counts from actual prefixes inside the kernel.
+    from flash_attn_npu import flash_attn_npu_interface as interface
+    monkeypatch.setattr(interface, "_use_eager_varlen_impl", lambda *args, **kwargs: False)
     q_lengths = [q_seqlen] * batch_size
     kv_lengths = [kv_seqlen] * batch_size
     q_offsets = _prefix_sums(q_lengths)

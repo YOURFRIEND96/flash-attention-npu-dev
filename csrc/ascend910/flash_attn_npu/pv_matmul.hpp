@@ -241,9 +241,8 @@ public:
             auto layoutBTile = layoutB.GetTileLayout(MakeCoord(actualShape.k(), actualShape.n()));
             copyGmToL1B(l1BTensor, gB[gBOffset], layoutBInL1, layoutBTile);
         }
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-
+        // The first P-ready event below also covers these earlier V loads
+        // on the same MTE2 pipe, before either operand is read by MTE1.
         uint32_t mL1Loop = CeilDiv(rowNum, L1TileShape::M);
         uint32_t kL1Loop = CeilDiv(stackSeqTile, l1KDynamic);
         uint32_t nL1Loop = CeilDiv(embed, L0TileShape::N);

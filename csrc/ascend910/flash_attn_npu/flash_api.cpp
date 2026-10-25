@@ -20,6 +20,7 @@
 #include "fag_tiling.cpp"
 #include "fag_general_host.hpp"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "torch_npu/csrc/aten/NPUGeneratorImpl.h"
 #include "third_party/op-plugin/op_plugin/include/ops.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
@@ -42,6 +43,61 @@
 // (Q_TILE_CEIL, ...) used by the host helpers below resolve.
 using namespace Catlass;
 using namespace KernelCommon;
+
+// These fields depend only on scalar configuration. Actual batch lengths are
+// never cached; the kernel derives its task count from the current Q prefix.
+static at::Tensor GetPlainVarlenTiling(const at::Tensor& q, int batch, int heads, int kvHeads,
+                                     int dim, int maxQ, int maxK, float scale, bool causal,
+                                     uint32_t blockDim)
+{
+    const auto cacheKey = std::make_tuple(q.get_device(), batch, heads, kvHeads, dim,
+                                     maxQ, maxK, scale, causal, blockDim);
+    struct Entry {
+        decltype(cacheKey) key;
+        at::Tensor tensor;
+    };
+    static thread_local std::deque<Entry> cache;
+    at::Tensor tensor;
+    for (const auto& entry : cache) {
+        if (entry.key == cacheKey) {
+            tensor = entry.tensor;
+            break;
+        }
+    }
+    if (!tensor.defined()) {
+        auto host = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))},
+                              at::device(at::kCPU).dtype(at::kByte));
+        auto* data = reinterpret_cast<FAInferTilingData*>(host.data_ptr<uint8_t>());
+        std::memset(data, 0, sizeof(*data));
+        data->batch = batch;
+        data->numHeads = heads;
+        data->kvHeads = kvHeads;
+        data->embeddingSize = dim;
+        data->embeddingSizeV = dim;
+        data->blockSize = 128;
+        data->maxQSeqlen = maxQ;
+        data->maxKvSeqlen = maxK;
+        data->scaleValue = scale;
+        data->dropoutValue = 1.0f;
+        data->maskType = causal ? static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL) : 0U;
+        data->windowSizeLeft = -1;
+        data->windowSizeRight = causal ? 0 : -1;
+        data->mm1OutSize = fa_metadata::Mm1OutSize(blockDim);
+        data->smOnlineOutSize = fa_metadata::SmOnlineOutSize(blockDim);
+        data->mm2OutSize = fa_metadata::Mm2OutSize(blockDim);
+        data->UpdateSize = fa_metadata::UpdateOutSize(blockDim);
+        data->workSpaceSize = fa_metadata::WorkSpaceSize(blockDim);
+        data->padding3 = FA_DYNAMIC_Q_TASKS;
+        tensor = host.to(q.device());
+        // Publish initialized immutable storage before reuse on another stream.
+        c10_npu::getCurrentNPUStream().synchronize();
+        if (cache.size() == 16) cache.pop_front();
+        cache.push_back({cacheKey, tensor});
+    }
+    c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(),
+                                              c10_npu::getCurrentNPUStream());
+    return tensor;
+}
 
 static void LaunchShortQueryBackward(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& cq, const at::Tensor& ck, const at::Tensor& out, const at::Tensor& lse,
@@ -1122,7 +1178,20 @@ std::vector<at::Tensor> mha_varlen_fwd(
         return {out, softmaxlse, p, rng_state};
     }
 
-    if (scheduler_metadata_.has_value()) {
+    const bool plainVarlen = !scheduler_metadata_.has_value() && !paged_KV && !is_local &&
+        !has_dropout && !has_softcap && alibi.ptr == nullptr && !return_softmax &&
+        c10_npu::currentStreamCaptureStatusMayInitCtx() == c10_npu::CaptureStatus::None;
+    if (plainVarlen) {
+        tiling_gpu_tensor = GetPlainVarlenTiling(q, batch_size, num_heads, num_heads_k,
+            head_size_og, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, blockDim);
+        tilingDevice = static_cast<uint8_t*>(tiling_gpu_tensor.data_ptr());
+        workspace_tensor = at::empty({static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim))},
+                                     at::device(at::kPrivateUse1).dtype(at::kByte));
+        if (is_causal) {
+            mask_gpu_tensor = MakeDeviceTriuMask();
+            maskDevice = static_cast<uint8_t*>(mask_gpu_tensor.data_ptr());
+        }
+    } else if (scheduler_metadata_.has_value()) {
         auto schedMd = scheduler_metadata_.value();
         TORCH_CHECK(schedMd.dtype() == at::kByte, "scheduler_metadata must be a byte tensor");
         TORCH_CHECK(schedMd.is_contiguous(), "scheduler_metadata must be contiguous");
