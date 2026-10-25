@@ -52,6 +52,8 @@ struct FagGeneralLaunchArgs {
     uint8_t *alibiSlopesDevice;
     uint8_t *workspaceDevice;
     uint8_t *tilingDevice;
+    // Run only when actual Q/K prefixes differ in a paired TND launch.
+    bool skip_equal_prefix = false;
 };
 
 // Per-(dtype, layout) implementation, defined in

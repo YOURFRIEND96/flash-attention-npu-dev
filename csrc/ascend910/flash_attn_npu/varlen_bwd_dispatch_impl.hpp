@@ -66,7 +66,7 @@ void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs &a) {
         FAG::FAGVarlenOpt<DType><<<blockDim, nullptr, aclStream>>>(
             fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
             attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-            nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, ptrDumpDevice);
+            nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, ptrDumpDevice, a.check_equal_prefix);
         aclCheck(aclrtSynchronizeStream(aclStream));
         Adx::AdumpPrintWorkSpace(ptrDumpDevice, ALL_DUMPSIZE, aclStream, "device_fag");
         aclCheck(aclrtFree(ptrDumpDevice));
@@ -77,24 +77,24 @@ void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs &a) {
                 FAG::FAGVarlenOpt<DType, MaskType::MASK_CAUSAL, InputLayout::TND, true, true><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
                     attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr);
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr, a.check_equal_prefix);
             } else {
                 FAG::FAGVarlenOpt<DType, MaskType::NO_MASK, InputLayout::TND, true, true><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
                     attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr);
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr, a.check_equal_prefix);
             }
         } else {
             if (is_causal) {
                 FAG::FAGVarlenOpt<DType, MaskType::MASK_CAUSAL, InputLayout::TND, false, true><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
                     attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr);
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr, a.check_equal_prefix);
             } else {
                 FAG::FAGVarlenOpt<DType, MaskType::NO_MASK, InputLayout::TND, false, true><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
                     attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr);
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr, a.check_equal_prefix);
             }
         }
     } else {
@@ -103,24 +103,24 @@ void launch_varlen_bwd_impl(const VarlenBwdLaunchArgs &a) {
                 FAG::FAGVarlenOpt<DType, MaskType::MASK_CAUSAL, InputLayout::TND, true, false><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
                     attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr);
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr, a.check_equal_prefix);
             } else {
                 FAG::FAGVarlenOpt<DType, MaskType::NO_MASK, InputLayout::TND, true, false><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
                     attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr);
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr, a.check_equal_prefix);
             }
         } else {
             if (is_causal) {
                 FAG::FAGVarlenOpt<DType, MaskType::MASK_CAUSAL, InputLayout::TND, false, false><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
                     attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr);
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr, a.check_equal_prefix);
             } else {
                 FAG::FAGVarlenOpt<DType, MaskType::NO_MASK, InputLayout::TND, false, false><<<blockDim, nullptr, aclStream>>>(
                     fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
                     attenMaskDevice, softMaxLseDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
-                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr);
+                    nullptr, nullptr, dqDevice, dkDevice, dvDevice, alibiSlopesDevice, workspaceDevice, tilingDevice, nullptr, a.check_equal_prefix);
             }
         }
     }

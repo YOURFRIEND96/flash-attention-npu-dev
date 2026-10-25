@@ -32,6 +32,9 @@ std::vector<at::Tensor> launch_fag_general(
     float p_dropout,
     const std::optional<at::Tensor> &rng_state,
     uint8_t *alibi_slopes_ptr,            
-    int64_t alibi_slopes_batch_stride);   
+    int64_t alibi_slopes_batch_stride,
+    bool allow_device_seq_lengths = false,
+    bool skip_equal_prefix = false,
+    const std::optional<at::Tensor> &shared_workspace = std::nullopt);
 
 #endif

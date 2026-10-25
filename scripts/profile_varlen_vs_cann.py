@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 import sys
 
-from benchmark_varlen_vs_cann import REPO, case_lengths, measure, parse_cases, prepare_case
+from benchmark_varlen_vs_cann import (
+    REPO, add_cann_lengths_arguments, cann_api_name, cann_lengths_description,
+    case_lengths, measure, parse_cases, prepare_case,
+)
 
 
 def measure_phase(case, dtype, name, forward, inputs, dout, phase, args, torch, torch_npu):
@@ -26,6 +29,9 @@ def measure_phase(case, dtype, name, forward, inputs, dout, phase, args, torch, 
     else:
         fn = forward
     row = dict(case=case.name, dtype=dtype, operator=name, phase=phase, accuracy="not_checked")
+    row.update(cann_lengths_mode=args.cann_lengths_mode,
+               cann_prefix_source_dtype="int32",
+               cann_api="torch_npu." + cann_api_name(args.cann_lengths_mode))
     row.update(measure(fn, args.warmup, args.iterations, args.repeats))
     print(json.dumps(row), flush=True)
     if args.trace and phase != "forward_backward":
@@ -52,7 +58,7 @@ def measure_phase(case, dtype, name, forward, inputs, dout, phase, args, torch, 
 def measure_case(case, dtype, args, flash, torch, torch_npu):
     # A function scope releases all closures/tensors before the next case's
     # input allocation, as the full accuracy benchmark does in run_case.
-    lengths = case_lengths(case, {}, args.seed)
+    lengths = case_lengths(case, args.length_overrides, args.seed)
     inputs, dout, fa, cann = prepare_case(case, *lengths, dtype, args, flash, torch_npu)
     rows = []
     for name, forward in (("flash", fa), ("cann", cann)):
@@ -76,6 +82,9 @@ def measure_case(case, dtype, args, flash, torch, torch_npu):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=1)
+    parser.add_argument("--cases", type=Path, default=REPO.parent / "testcase.md")
+    parser.add_argument("--lengths-json", type=Path)
+    add_cann_lengths_arguments(parser)
     parser.add_argument("--case", action="append")
     parser.add_argument("--dtype", choices=("fp16", "bf16", "both"), default="fp16")
     parser.add_argument("--seed", type=int, default=2026)
@@ -94,6 +103,7 @@ def main():
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    args.length_overrides = json.loads(args.lengths_json.read_text()) if args.lengths_json else {}
     import torch
     import torch_npu
 
@@ -104,8 +114,13 @@ def main():
     from flash_attn_npu import flash_attn_varlen_func
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    config["cann_api"] = "torch_npu." + cann_api_name(args.cann_lengths_mode)
+    config["cann_lengths_description"] = cann_lengths_description(args.cann_lengths_mode)
+    config["cann_prefix_source_dtype"] = "int32"
+    (args.output_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     rows = []
-    for case in parse_cases(REPO.parent / "testcase.md"):
+    for case in parse_cases(args.cases):
         if args.case and case.name not in args.case:
             continue
         for dtype in ("fp16", "bf16") if args.dtype == "both" else (args.dtype,):

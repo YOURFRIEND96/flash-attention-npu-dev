@@ -5,14 +5,18 @@ Example (from the repository root, after building the v2 extension):
   python scripts/benchmark_varlen_vs_cann.py --device 1 --dtype both
   python scripts/benchmark_varlen_vs_cann.py --dry-run
 
-The CANN Python API is torch_npu.npu_fusion_attention (FlashAttentionScore),
-not npu_fusion_attention_score. Both backward paths use torch.autograd.grad.
+The default CANN API is torch_npu.npu_fusion_attention_v3, whose sequence-length
+arguments are CPU Tensors copied from the same NPU prefixes supplied to Flash.
+The explicit device-to-host mode adapts these prefixes to the older int[] API
+inside every forward; host-precomputed preserves the old diagnostic convention.
+Both backward paths use torch.autograd.grad.
 All output and Q/K/V gradient elements are checked against chunked CPU FP32
 and low-precision references using the repository's dual-reference error rule.
-Correctness, transfers, input construction and masks are NOT timed.
+Correctness, initial input transfers, input construction and masks are NOT timed.
 Forward timing has autograd enabled; backward reuses a retained forward graph;
 forward+backward creates a fresh graph each iteration. NPU events measure the
 eager stream interval, including submission gaps, NOT isolated kernel time.
+Prefix adaptation required by the selected CANN mode is included in F/F+B.
 
 Missing per-sequence lengths are synthesized: reserve one maximum-length
 sequence, balance the remaining tokens, then shuffle with a fixed seed. Supply
@@ -45,6 +49,71 @@ API_DOC = (
     "https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/"
     "docs/en/custom_APIs/torch_npu/torch_npu-npu_fusion_attention.md"
 )
+CANN_LENGTHS_MODES = ("device-tensor", "device-to-host", "host-precomputed")
+
+
+def add_cann_lengths_arguments(parser):
+    parser.add_argument(
+        "--cann-lengths-mode", choices=CANN_LENGTHS_MODES, default="device-tensor",
+        help="device-tensor: timed bulk D2H to V3 CPU Tensor metadata; device-to-host: D2H to the "
+        "legacy API; host-precomputed: legacy diagnostic without prefix-transfer cost",
+    )
+
+
+def cann_api_name(mode):
+    if mode not in CANN_LENGTHS_MODES:
+        raise ValueError(f"Unknown CANN lengths mode: {mode}")
+    return "npu_fusion_attention_v3" if mode == "device-tensor" else "npu_fusion_attention"
+
+
+def cann_lengths_description(mode):
+    if mode == "device-tensor":
+        return (
+            "CANN lengths mode=device-tensor: Flash and CANN share the same NPU int32 "
+            "cumulative-length sources. On this installation npu_fusion_attention_v3 "
+            "requires CPU Tensor metadata: every forward performs .cpu()[1:] on each "
+            "prefix, preserving int32 and dropping the initial zero. D2H is included in "
+            "forward/forward_backward. CPU int32 was validated on this installation; "
+            "the installed documentation lists int64 only. Retained backward uses native "
+            "V3 autograd's saved metadata; no extra D2H is injected."
+        )
+    if mode == "device-to-host":
+        return (
+            "CANN lengths mode=device-to-host: each legacy npu_fusion_attention forward "
+            "reads the same NPU int32 prefixes as Flash using one bulk .cpu().tolist()[1:] "
+            "per prefix. D2H and Python-list conversion are included in forward/forward_backward. "
+            "Retained backward reuses CANN autograd's saved metadata; no extra D2H is injected."
+        )
+    if mode == "host-precomputed":
+        return (
+            "CANN lengths mode=host-precomputed: legacy diagnostic using CPU cumulative "
+            "length tuples prepared outside timing. This excludes device-prefix transfer "
+            "cost and is not the shared-device-prefix comparison."
+        )
+    raise ValueError(f"Unknown CANN lengths mode: {mode}")
+
+
+def make_cann_forward(q, k, v, cuq, cuk, torch_npu, kwargs, *,
+                      lengths_mode="device-tensor", host_lengths=None):
+    """Keep all requested prefix adaptation inside the measured forward call."""
+    name = cann_api_name(lengths_mode)
+    operator = getattr(torch_npu, name, None)
+    if operator is None:
+        raise RuntimeError(f"Selected CANN lengths mode {lengths_mode!r} requires torch_npu.{name}; "
+                           "select another mode explicitly if this API is unavailable")
+    if lengths_mode == "host-precomputed" and host_lengths is None:
+        raise ValueError("host-precomputed requires explicit CPU cumulative lengths")
+
+    def forward():
+        if lengths_mode == "device-tensor":
+            qends, kends = cuq.cpu()[1:], cuk.cpu()[1:]
+        elif lengths_mode == "device-to-host":
+            qends, kends = cuq.cpu().tolist()[1:], cuk.cpu().tolist()[1:]
+        else:
+            qends, kends = host_lengths
+        return operator(q, k, v, actual_seq_qlen=qends, actual_seq_kvlen=kends, **kwargs)[0]
+
+    return forward
 
 
 @dataclass
@@ -281,8 +350,6 @@ def prepare_case(case, qlens, klens, dtype_name, args, flash, torch_npu):
         keep_prob=1.0,
         pre_tockens=2147483647,
         next_tockens=0 if case.causal else 2147483647,
-        actual_seq_qlen=tuple(cq[1:]),
-        actual_seq_kvlen=tuple(ck[1:]),
         sparse_mode=3 if case.causal else 0,
     )
 
@@ -300,8 +367,12 @@ def prepare_case(case, qlens, klens, dtype_name, args, flash, torch_npu):
             causal=case.causal,
         )
 
-    def cann_forward():
-        return torch_npu.npu_fusion_attention(q, k, v, **cann_kwargs)[0]
+    cann_mode = getattr(args, "cann_lengths_mode", "device-tensor")
+    cann_forward = make_cann_forward(
+        q, k, v, cuq, cuk, torch_npu, cann_kwargs,
+        lengths_mode=cann_mode,
+        host_lengths=(tuple(cq[1:]), tuple(ck[1:])) if cann_mode == "host-precomputed" else None,
+    )
 
     return (q, k, v), dout, fa_forward, cann_forward
 
@@ -445,6 +516,10 @@ def write_report(report, directory):
         "Sequence lengths are synthetic unless supplied with --lengths-json; "
         "see results.json for full lengths, versions, tolerances and samples.\n\n"
     )
+    # Historical reports without this option used precomputed Host tuples.
+    notes += cann_lengths_description(
+        report["config"].get("cann_lengths_mode", "host-precomputed"),
+    ) + "\n\n"
     environment = report.get("environment", {})
     if environment:
         notes += (
@@ -519,13 +594,17 @@ def write_report(report, directory):
                 "cann_over_flash",
                 "flash_wall_us",
                 "cann_wall_us",
+                "cann_api",
+                "cann_lengths_mode",
             ]
         )
         for row in report["results"]:
             for phase in ("forward", "backward", "forward_backward"):
                 if "speedup" not in row:
                     writer.writerow(
-                        [row["case"], row["dtype"], row["status"], phase, "", "", "", "", ""]
+                        [row["case"], row["dtype"], row["status"], phase, "", "", "", "", "",
+                         report.get("cann_api", "torch_npu.npu_fusion_attention"),
+                         report["config"].get("cann_lengths_mode", "host-precomputed")]
                     )
                     continue
                 fa, cann = [row["operators"][op]["timing"][phase] for op in ("flash", "cann")]
@@ -540,6 +619,8 @@ def write_report(report, directory):
                         row["speedup"][phase],
                         fa["wall_us"],
                         cann["wall_us"],
+                        report.get("cann_api", "torch_npu.npu_fusion_attention"),
+                        report["config"].get("cann_lengths_mode", "host-precomputed"),
                     ]
                 )
 
@@ -551,6 +632,7 @@ def main(argv=None):
     parser.add_argument("--cases", type=Path, default=REPO.parent / "testcase.md")
     parser.add_argument("--case", action="append", help="Exact case name; repeat to select several")
     parser.add_argument("--lengths-json", type=Path)
+    add_cann_lengths_arguments(parser)
     parser.add_argument("--dtype", choices=("fp16", "bf16", "both"), default="both")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=2026)
@@ -590,8 +672,13 @@ def main(argv=None):
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "config": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-        "cann_api": "torch_npu.npu_fusion_attention",
-        "api_documentation": API_DOC,
+        "cann_api": "torch_npu." + cann_api_name(args.cann_lengths_mode),
+        "api_documentation": (
+            "torch_npu/_op_plugin_docs.py:npu_fusion_attention_v3 (installed documentation)"
+            if args.cann_lengths_mode == "device-tensor" else API_DOC
+        ),
+        "cann_lengths_description": cann_lengths_description(args.cann_lengths_mode),
+        "cann_prefix_source_dtype": "int32",
         "cases": [
             {
                 **asdict(c),

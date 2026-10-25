@@ -1231,7 +1231,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic = deterministic
             ctx.head_size_og = head_size_og
 
-        out = out_padded[..., :head_size_og]
+        # A full-width slice only adds a view and dispatcher work.
+        out = out_padded if out_padded.shape[-1] == head_size_og else out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -1274,9 +1275,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
         if eager:
             dq, dk, dv, _ = gradients
-        dq = dq[..., :head_size_og]  # We could have padded the head dimension
-        dk = dk[..., :head_size_og]
-        dv = dv[..., :head_size_og]
+        if dq.shape[-1] != head_size_og:
+            dq = dq[..., :head_size_og]
+            dk = dk[..., :head_size_og]
+            dv = dv[..., :head_size_og]
         return (
             dq,
             dk,

@@ -182,6 +182,16 @@ void FillWorkSpaceTilingData(FAGTilingData &fagTilingData) {
 
 bool DoPreTiling(FAGTilingData &fagTilingData)
 {
+    if (fagTilingData.keepProb == 1.0f && fagTilingData.dropMaskSize == 0) {
+        // No dropout: only the sfmg base is needed. Avoid partitioning the
+        // unused legacy bool-mask, which would divide by zero here.
+        int64_t offset = MUL_CORE_SYNC_BUFFER;
+        offset = (offset + fagTilingData.qSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+        offset = (offset + fagTilingData.kvSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+        offset = (offset + fagTilingData.vSize * sizeof(float) + GM_ALIGN) / GM_ALIGN * GM_ALIGN;
+        fagTilingData.dropBeginAddr = offset;
+        return true;
+    }
     uint32_t castBufferLen = 60 * 1024;
     uint32_t outputBufferLen = 30 * 1024;
     uint32_t inputBufferLen = 4 * 1024;
@@ -314,7 +324,20 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
     fagTilingData.g = fagInfo.qHeadNum / fagInfo.kvHeadNum;
 
     bool isTnd = fagInfo.layout == TND;
-    if (isTnd) {
+    if (isTnd && fagInfo.useDeviceSeqLengths) {
+        if (fagInfo.keepProb != 1.0f || fagInfo.isDeterministic ||
+            fagInfo.qUsedLenList != nullptr || fagInfo.kvUsedLenList != nullptr ||
+            fagInfo.totalQueryTokens <= 0 || fagInfo.totalKvTokens <= 0 ||
+            fagInfo.qSeqlen <= 0 || fagInfo.kvSeqlen <= 0) {
+            return -1;
+        }
+        fagTilingData.layoutType = TND;
+        fagTilingData.t1 = fagInfo.totalQueryTokens;
+        fagTilingData.t2 = fagInfo.totalKvTokens;
+        // Keep all batches, including trailing empties. The device scheduler
+        // reads actual lengths and computes its valid tiles for each batch.
+        fagTilingData.sumS1S2Product = 0; // unused without dropout
+    } else if (isTnd) {
         fagTilingData.layoutType = TND;
         auto actualSeqQlenTensor = fagInfo.qSeqlenList;
         auto actualSeqKvlenTensor = fagInfo.kvSeqlenList;
@@ -421,7 +444,8 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
 
     // Full MHA in one CV tile has exactly one writer per gradient
     // element. Empty/used-length, GQA and deterministic paths retain zero+add.
-    fagTilingData.exclusiveGradOutput = fagTilingData.layoutType == TND &&
+    fagTilingData.exclusiveGradOutput = !fagInfo.useDeviceSeqLengths &&
+        fagTilingData.layoutType == TND &&
         fagTilingData.maskType == static_cast<uint32_t>(MaskType::NO_MASK) &&
         !fagTilingData.isDeterministic && fagTilingData.g == 1 &&
         fagTilingData.s1Outer == 1 && fagTilingData.s2Outer == 1 &&

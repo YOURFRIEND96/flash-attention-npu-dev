@@ -14,6 +14,7 @@
 
 #include "../flash_attn_npu/fag_block.h"
 #include "../flash_attn_npu/fag_kernel_common.hpp"
+#include "../flash_attn_npu/fag_common/prefix_route.hpp"
 #include "fag_common/epilogue_fag_deterministic_add.hpp"
 #include "../flash_attn_npu/fag_epilogue_sfmg.hpp"
 #include "../flash_attn_npu/fag_epilogue_op.hpp"
@@ -1045,8 +1046,19 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
                         GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen,
                         GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq_,
                         GM_ADDR dk_, GM_ADDR dv_, GM_ADDR alibi_slopes_,
-                        GM_ADDR workspace, GM_ADDR tiling, GM_ADDR ptrDump = nullptr
+                        GM_ADDR workspace, GM_ADDR tiling, GM_ADDR ptrDump = nullptr,
+                        bool skipEqualPrefix = false
 ) {
+    if constexpr (INPUT_LAYOUT == TND) {
+        if (skipEqualPrefix) {
+            const auto* tilingData = reinterpret_cast<__gm__ FAGTilingData*>(tiling);
+            // Complement of FAGVarlenOpt's guard. This must precede every
+            // global synchronization and all gradient/workspace writes.
+            if (fag_route::EqualPrefixes(cu_seq_qlen, cu_seq_kvlen, tilingData->batch)) {
+                return;
+            }
+        }
+    }
     // Set FFTS address
     AscendC::SetSyncBaseAddr(fftsAddr);
 

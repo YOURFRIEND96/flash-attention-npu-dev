@@ -69,6 +69,11 @@ struct FAGInfo {
     int64_t window_size_right;
     int32_t *qSeqlenList{nullptr};
     int32_t *kvSeqlenList{nullptr};
+    // Plain TND may keep actual lengths on device. Maxima are bounds, and
+    // packed totals come from tensor shapes; no synthetic sequence list.
+    bool useDeviceSeqLengths = false;
+    int64_t totalQueryTokens = 0;
+    int64_t totalKvTokens = 0;
     // Optional per-batch *used* lengths; heuristics only, sizes stay region-based.
     int32_t *qUsedLenList{nullptr};
     int32_t *kvUsedLenList{nullptr};

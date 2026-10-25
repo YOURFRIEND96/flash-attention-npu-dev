@@ -296,3 +296,195 @@ F+B等权几何平均1.09749×、算术平均1.15641×、累计耗时比0.98651�
 - E39复用已经完成的eager判断，避免重复分发检查。
 
 已撤回/未加入：E36当前batch prefix缓存未显示Qwen收益，已撤回；相邻任务二元分块只完成CPU调度检查，未在NPU实测，未加入；batch/prefix预算分支没有足够性能依据，未加入。所有当前路径继续支持非等长TND，新增同一prefix张量原地变更和跨stream回归通过。
+
+## E39泛化测量：4096以下与4096边界
+
+本轮仅测量已提交的`7959288`，没有修改实现或重新编译。新增[用例表](../scripts/benchmark_cases/varlen_upto4096.md)及[实际非等长prefix](../scripts/benchmark_cases/varlen_upto4096_lengths.json)。22形状×FP16/BF16共44项，覆盖MHA/GQA/MQA、causal/full、Q/K不等长、D64/128/256；Hq均为8，scale均为1/sqrt(D)，正长度，无dropout/local/softcap/ALiBi。NPU1，同原基准10次预热、50次×5轮中位数，reference_batch=1完整CPU双参考，测量期间无并行编译。
+
+Flash全部44项out/dQ/dK/dV检查通过；其中42项双方均通过精度并取得有效性能对照。Q1025/K513 causal的两种dtype被当前CANN9.2 TND/sparse_mode=3拒绝（每batch Sq>Skv会出现invalid row），保留为不可比，未改mask语义或删掉用例。Flash这两项的检查结果保存在原始日志及`validation/flash_accuracy_from_log.json`。因此本轮对照覆盖不是44/44成功，不应笼统称全部接口测试通过。
+
+| 子集 | 有效对照/应测 | F+B≥0.9× | 几何平均 | 累计耗时比 |
+|---|---:|---:|---:|---:|
+| 严格小于4096 | 38/40 | 3/38 | 0.72800× | 0.76537× |
+| 4096边界 | 4/4 | 4/4 | 0.96860× | 0.96740× |
+| 合计 | 42/44 | 7/42 | 0.74807× | 0.80733× |
+
+下表均为独立测量的前反向总耗时加速比CANN/Flash；D128、causal、GQA4的Hq/Hkv=8/2。每组内部S非等长，表中S是实际最大值，B随S变化，不能解释为固定batch的长度扩展曲线。
+
+| 最大S | B | MHA FP16 | MHA BF16 | GQA4 FP16 | GQA4 BF16 |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 32 | 0.600× | 0.580× | 0.630× | 0.480× |
+| 128 | 16 | 0.615× | 0.634× | 0.613× | 0.633× |
+| 256 | 16 | 0.613× | 0.622× | 0.618× | 0.610× |
+| 512 | 8 | 0.799× | 0.825× | 0.613× | 0.647× |
+| 1024 | 4 | 0.848× | 0.824× | 0.758× | 0.868× |
+| 2048 | 2 | 0.849× | 0.877× | 0.895× | 0.914× |
+| 4096 | 2 | 0.904× | 0.949× | 1.003× | 1.024× |
+
+其他覆盖：full MHA S512为0.826×/0.769×，full GQA S2048为0.767×/0.773×，full MHA S4095为0.783×/0.825×；短Q4/K4095为0.912×/0.919×，GQA Q129/K2049为0.691×/0.705×；D64 MQA为0.760×/0.743×，D256 GQA2为0.788×/0.780×。此处顺序均为FP16/BF16。
+
+结论：原五场景10项的0.9×验收不能外推至整个4096以下范围。本矩阵中的短序列和若干full/GQA场景仍有明显差距；部分差距集中在反向，例如MHA S64 FP16前向90.0/89.1μs（Flash/CANN），反向374.2/194.6μs。GQA S4096 FP16的前向397.7/826.5μs、反向1326.7/920.4μs，前反向合计才达到1.003×；不能把总耗时持平解释为两个阶段都持平。
+
+个别短序列样本波动较大，原始5轮全部保留，统一采用中位数，没有筛选最优样本。严格小于4096的累计耗时比0.76537×对应Flash累计耗时约多30.66%；这是合成用例等次数执行的汇总，不代表生产流量权重。没有旧版本在同一新矩阵的对照，不能将当前与CANN的差距直接认定为此前优化导致的回退。
+
+[泛化汇总及逐项F+B耗时](../../benchmark_results/generalization_upto4096_e39/summary.md) · [完整三阶段报告](../../benchmark_results/generalization_upto4096_e39/results.md) · [F+B CSV](../../benchmark_results/generalization_upto4096_e39/forward_backward.csv) · [原始样本](../../benchmark_results/generalization_upto4096_e39/results.json)。`validation/run.sh`可复现，保留源码版本/二进制哈希、用例副本和完整日志。
+
+
+## E40起：D128泛化0.95目标与profiling定位
+
+本轮验收继续使用原基准的eager前向+反向连续执行总耗时，CANN/Flash目标≥0.95×、挑战1.0×；原五场景10项另作性能回归。D128泛化矩阵为40应测/38可比，E39只有2项≥0.95（GQA4 S4096两dtype）；严格<4096为36应测/34可比，0项达标。两项CANN拒绝的Q>K causal仍保留不可比，D64/D256用于兼容回归。
+
+E40 profiling使用实际ragged fixtures，新增profile脚本`--cases`/`--lengths-json`参数，数据在`../../benchmark_results/profile_e40_baseline/`。FP16反向3次trace的kernel中位数：
+
+| 用例 | Flash FAG kernel μs | CANN kernel μs | Flash Equal kernel μs |
+|---|---:|---:|---:|
+| MHA causal S64 | 94.50 | 107.44 | 2.96 |
+| GQA4 causal S256 | 130.54 | 148.60 | 2.78 |
+| MHA causal S2048 | 432.55 | 346.67 | 3.84 |
+
+`aten::equal`在预热后的trace调用仍约99–121μs，包含`_local_scalar_dense`约60–77μs的主机等待。设备比较只有约3μs，不能用该数值代表完整开销。短序列Flash kernel已快于CANN，但Host bool分发切断提交；长序列还存在kernel差距。general路线另有每次两次prefix D2H和tiling H2D，需要分别消除。
+
+同值独立prefix与alias的诊断仅用于量化同步成本，不修改正式benchmark输入，不作为验收：MHA S64 FP16总耗时368.96→278.65μs，同轮CANN215.11μs；GQA S256为378.76→281.90μs，同轮CANN256.43μs；S2048为651.70→583.55μs，同轮CANN599.74μs。去掉Equal并不足以保证全部短序列达标。保留`alias_diagnostic_original.json`和原始日志；后续仍使用两份独立prefix进行完整精度、性能验证。
+
+候选设计：普通无额外功能的D128用设备读取实际prefix决定opt/general互斥执行；general tiling只缓存shape、声明max长度上界及总token等不可变标量，不缓存prefix值或相等结果，不制造等长序列。空batch、同总token但不同Q/K分段、prefix原地修改与跨stream都纳入回归。该设计随后在E41–E43落地，最终验收见文末。
+
+
+### 统一cu_seqlens来源和CANN适配计时（用户补充口径）
+
+此前CANN使用计时外准备的CPU tuple，Flash使用NPU int32 prefix，这两种接口准备条件不同，旧数据保留为`host-precomputed`诊断。后续默认`--cann-lengths-mode device-tensor`，两侧从完全相同的cuq/cuk NPU Tensor取值。CANN包装函数每次前向执行`cu.cpu()[1:]`，批量D2H、去掉初始零后将CPU Tensor交给`torch_npu.npu_fusion_attention_v3`；这些适配发生在计时闭包内，未缓存长度值。独立B测量按原生autograd复用前向保存的CPU metadata，没有人为增加额外拷贝。
+
+已实测本机V3：NPU int32/int64长度Tensor均报`tensor must be on CPU`；CPU int32/int64均成功，out/dQ/dK/dV与原int[]接口逐元素相同。因此默认保留与Flash一致的int32源，不增加人为cast；安装文档只列int64，报告明确本机实际验证范围。原始probe脚本及日志在`perf_e41_diagnostic/validation/`。另提供显式`device-to-host`模式（旧API，每call批量D2H转Python列表），不静默切换接口。CPU基准单测11/11通过，验证同一prefix内容更新每次被读取、retained B不添加人工拷贝、旧模式和新模式标签可区分。
+
+### E41设备反向分发与泛化安全检查
+
+普通连续D128、无dropout/local/softcap/ALiBi、非deterministic、非capture路径：同总token并不推断每batch相等，在两个kernel入口分别比较实际B个累计终点，只有匹配的分支进入计算。optimized与general的互补guard位于任何workspace/gradient写入及跨核同步之前。general tiling采用声明max作为上界、精确Tq/Tk作为workspace大小，设备仍读取每batch真实prefix；仅缓存不可变标量blob，初次同步发布和recordStream保护生命周期。原large-batch full-MHA exclusive路径保持原分发。
+
+集成审查修正：optimized接收B+1 prefix，general接收已去首零的B个终点，必须比较相同的B项，不能在general读B+1项；optimized prefix地址改为data_ptr以尊重非零storage offset。补齐prefix一维、同设备、正batch及int32连续性守卫。新回归改变同地址且不变version的prefix，检查equal→unequal→equal、空batch、跨stream和完整梯度，避免任何指针/版本值缓存假设。
+
+首轮新增回归暴露原optimized scheduler空batch缺陷：S=0但q步长仍2，qSeqIdx无法再等于s1BlockNum=0，形成无效矩形并最终越界。修复CubeAddr/VectorAddr在保持当前segment填充位置的同时跳空batch，末尾空batch正确终止。CPU真实header模拟5376配置通过ASan/UBSan；与原scheduler移除空batch后的逐核逐段descriptor完全一致。首轮失败日志及dump保留，没有删除用例。不同Tq/Tk动态prefix的4项及成对分发新增8项NPU回归均已包含在最终226项通过结果中；总token全部为零仍由公开Python接口拒绝，不宣称支持该输入。
+
+E41正常非空用例快速诊断（未检查独立精度，不作最终验收）：FP16总耗时Flash/CANN为S64 MHA270.8/412.8μs、S256 GQA268.8/440.8μs、full S2048 GQA833.9/924.9μs、full S4095 MHA3446.5/3334.2μs。这里CANN已包含同源Tensor的D2H，不能把相对E39旧CANN口径的ratio增长全部称为kernel优化收益。
+
+
+### E42/E43：full分块选择与临时区复用
+
+E42试验普通D128 full attention超过一个512×512 CV块时使用general scalar路线。optimized长full常形成256×1024 segment，general为512×512；L0同为128×128×128，后者改善Q/K两端复用并减少dK/dV重复atomic更新。以理想S4096为例，每元素dQ/dK/dV累加次数由4/16/16变为8/8/8；这是访存/累加调度差异，不能称Cube FLOPs减少，也不假设真实ragged长度相同。
+
+诊断中MHA full S4095 FP16总耗时由E41的3446.5μs降至2930.1μs，约14.98%；同轮新口径CANN2935.6μs。BF16为2926.1/3160.0μs。GQA full S2048则从E41 FP16 833.9μs变为868.3μs，未显示收益，因此E43只保留多CV块full **MHA** 的路由，GQA继续原optimized路线。该条件使用mask/head关系/CV容量，不按模型、精确S或batch等长分发；原Qwen causal、Encoder单CV和Cross短Q路径保持。
+
+E43复用paired路径的workspace：optimized先提交，general后提交，同stream且predicate互斥，两者分别按各自offset初始化/使用临时区。general只在已有Byte workspace同设备、连续、零storage offset且容量充足时复用，否则正常分配。当前24AIC/48AIV的普通D128路径，opt workspace比最坏512×512 general至少大46,073,344 bytes（43.939MiB），与B、实际ragged长度、head数和两种dtype无关；因此本矩阵不再同时保留两份scratch，峰值为原optimized大小。精确公式与生命周期审查见`perf_e43/validation/shared_workspace_analysis.txt`。未复用输入内容、梯度或可变metadata。
+
+Python同时移除未padding时的全宽out/dQ/dK/dV切片；需要截断时仍保留切片，不改变输出尺寸。独立短序列诊断显示减少约30–40μs的Host提交开销，但长序列有运行波动，不用该诊断代替完整验收。E41c原始17项精度/模式回归通过；E43增加非零storage offset的prefix view检查，完整226项回归与两个矩阵的最终测试均已结束，结果如下。
+
+
+参考实现与指令依据：本地`ops-transformer/attention/flash_attention_score_grad/op_host/arch22/flash_attention_score_grad_tiling_s1s2_bn2gs1s2_sab.cpp`第72/74行的SameAB 512×512基础CV块及`AdjustCvInner`、对应arch22 kernel的Cube/Vector分段同步；本轮采用已有general kernel实现该分块，未将Flash调用替换为CANN。设备互斥guard遵守`asc-devkit/docs/zh/api/SIMD-API/basic_api/sync_control/inter_core_sync/SyncAll.md`与`intra_core_sync/SetFlag_WaitFlag_ISASI.md`的同步生命周期约束，所有参与核必须在任何collective前一致选路；未删除既有计算阶段的Set/Wait或SyncAll。
+
+E43冻结候选完整NPU回归 **226/226通过**（348.77秒），覆盖原218项及新增8项设备分发回归；新增测试同时采用非零storage offset的连续prefix view。日志`perf_e43/validation/regression.log`，冻结代码（含新增header、测试、fixtures）及SHA256在同目录`sources/`、`source_version.json`。CPU benchmark单测11/11通过，新增CSV口径标签经dry-run六行逐一核对；所有精度规则和容差不变。
+
+## E43最终验收：同源Tensor、计入CANN D2H
+
+2026-10-25，Ascend910_9362 / CANN 9.2.0 / torch_npu 2.7.1.post11，NPU 1。沿用10次预热、每轮50次、5轮中位数；原五场景reference_batch=16，泛化reference_batch=1，均执行完整CPU FP32与低精度双参考。两个矩阵使用同一冻结构建，测量期间无并行编译；[版本与哈希](../../benchmark_results/perf_e43/validation/source_version.json)及[最终一致性检查](../../benchmark_results/perf_e43/validation/frozen_check.json)已归档。
+
+**主指标为独立测量的F+B总耗时比CANN/Flash，≥0.95达标、≥1表示Flash持平或更快。** F+B不是独立F与B计时结果相加。NPU Event记录eager stream耗时，包含主机提交造成的stream空隙；这些结果不是纯kernel耗时。CANN默认V3 Tensor接口，每次前向从与Flash相同的NPU int32 cuq/cuk执行`.cpu()[1:]`，D2H包含在F及F+B计时内；单独B按原生autograd复用保存的CPU metadata。未用预先准备的Host tuple代替本轮Tensor口径。
+
+| 范围 | 双接口有效对照/应测 | ≥0.95 | ≥1 | 最低比值 | 几何平均 | 累计耗时比 |
+|---|---:|---:|---:|---:|---:|---:|
+| 原五场景×两dtype | 10/10 | 10/10 | 9/10 | 0.95576× | 1.25933× | 1.05182× |
+| D128，严格<4096 | 34/36 | 34/34 | 34/34 | 1.00729× | 1.37272× | 1.25842× |
+| D128，4096边界 | 4/4 | 4/4 | 4/4 | 1.03357× | 1.09074× | 1.08961× |
+| D128合计 | 38/40 | 38/38 | 38/38 | 1.00729× | 1.33990× | 1.21531× |
+| D64辅助项 | 2/2 | 2/2 | 2/2 | 1.05564× | 1.06995× | 1.07023× |
+| D256辅助项 | 2/2 | 2/2 | 2/2 | 1.02793× | 1.03099× | 1.03101× |
+
+表中D128合计包含前两项，不能重复累加。阈值判断用未舍入数据；累计耗时比为ΣCANN/ΣFlash，各用例等次数执行，不代表生产流量权重。泛化44项中，Flash **44/44** 的out/dQ/dK/dV精度通过，CANN **42/44** 通过并取得性能结果。另两项为Q1025/K513 causal的FP16/BF16：当前CANN对实际Sq>Skv、右下对齐causal存在invalid row的输入报错，保留`runtime_error`，没有改mask、删用例或计入均值。对应Flash精度证据来自完整日志，见[未配对精度记录](../../benchmark_results/generalization_upto4096_e43/validation/flash_accuracy_from_log.json)。泛化脚本因此退出码为1，表示存在这两项CANN执行错误，不能称44项双方全部验收成功。
+
+### 原五场景逐项F+B
+
+| 场景 | dtype | Flash μs | CANN μs | CANN/Flash |
+|---|---|---:|---:|---:|
+| Qwen3 3B | fp16 | 994.277 | 1132.869 | 1.139× |
+| Qwen3 3B | bf16 | 1005.875 | 1155.408 | 1.149× |
+| Qwen3 4B | fp16 | 1346.366 | 1489.921 | 1.107× |
+| Qwen3 4B | bf16 | 1341.939 | 1508.813 | 1.124× |
+| T5 Encoder | fp16 | 14566.418 | 14750.133 | 1.013× |
+| T5 Encoder | bf16 | 14940.381 | 15160.868 | 1.015× |
+| T5 Decoder | fp16 | 837.788 | 2065.175 | 2.465× |
+| T5 Decoder | bf16 | 828.265 | 2069.413 | 2.498× |
+| T5 Cross | fp16 | 11917.770 | 12138.329 | 1.019× |
+| T5 Cross | bf16 | 12659.503 | 12099.482 | 0.956× |
+
+原五场景均通过0.95目标，Cross BF16尚未持平。仅比较Flash绝对耗时与E39检查点：累计减少1.646%；Decoder FP16增加0.735%（6.112μs）、Cross BF16增加0.299%（37.754μs），其余8项下降。两项小幅增加如实保留，不能声称逐项耗时完全没有上升。
+
+### D128泛化逐项F+B比值
+
+下表causal、Hq=8，GQA4的Hkv=2；每个batch使用fixture中的真实非等长S。B随S变化，不能当作固定batch的长度扩展曲线。
+
+| 最大S | B | MHA FP16 | MHA BF16 | GQA4 FP16 | GQA4 BF16 |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 32 | 1.218× | 1.511× | 1.183× | 1.181× |
+| 128 | 16 | 1.295× | 1.670× | 1.288× | 1.246× |
+| 256 | 16 | 1.774× | 1.377× | 1.588× | 1.689× |
+| 512 | 8 | 1.605× | 1.468× | 1.725× | 1.843× |
+| 1024 | 4 | 1.336× | 1.373× | 1.521× | 1.472× |
+| 2048 | 2 | 1.279× | 1.289× | 1.348× | 1.406× |
+| 4096 | 2 | 1.062× | 1.034× | 1.133× | 1.139× |
+
+| 其他D128场景 | FP16 | BF16 |
+|---|---:|---:|
+| MHA full S512 | 1.335× | 1.290× |
+| GQA4 full S2048 | 1.039× | 1.014× |
+| MHA full S4095 | 1.007× | 1.107× |
+| MHA cross Q4 K4095 | 1.181× | 1.150× |
+| GQA4 cross Q129 K2049 | 1.839× | 1.679× |
+| MHA cross Q1025 K513 | CANN拒绝 | CANN拒绝 |
+
+D128全部38个可比项在本轮均达到总耗时持平目标，最接近边界的是MHA full S4095 FP16，2901.736μs/2922.880μs（Flash/CANN），比值1.0072867。对应38项Flash累计耗时由E39的32719.447μs降至28067.097μs，下降14.219%；这是同输入的跨轮Flash绝对时间诊断，仍存在系统、提交和分配器状态波动。**E39 CANN使用计时外Host tuple，E43计入同源prefix D2H，新旧CANN/Flash比值的提升不能全部归因于Flash优化。**
+
+本轮结论限于测量矩阵和F+B指标。独立反向仍有差距（泛化42个可比项的B几何平均约0.803×），不能把F+B持平解释为前向、反向分别持平，也不保证未测shape的性能。未降低精度容差；226项回归覆盖动态/空prefix、非零storage offset、跨stream、GQA、尾块、D64/D256、metadata、dispatch/compile及KV cache/paged/SWA，均通过。
+
+最终保留设备prefix互斥分发、general标量tiling复用、full MHA多CV分块、成对kernel临时区复用及无padding时消除全宽切片；修复原optimized空batch调度。撤回无收益的full GQA路由。P/dS覆盖QK/dP临时区仅完成分析，未实现或实测，未计入收益；没有引入等长TND假设或固定模型/精确S特例。
+
+[原五场景汇总及E39对照](../../benchmark_results/perf_e43/summary.md) · [原五场景完整精度/三阶段数据](../../benchmark_results/perf_e43/results.md) · [泛化汇总及全部逐项耗时](../../benchmark_results/generalization_upto4096_e43/summary.md) · [泛化完整精度/三阶段数据](../../benchmark_results/generalization_upto4096_e43/results.md) · [泛化F+B CSV](../../benchmark_results/generalization_upto4096_e43/forward_backward.csv) · [泛化原始样本](../../benchmark_results/generalization_upto4096_e43/results.json)。两个目录的`validation/run.sh`保留复现命令，`validation/benchmark.log`保留完整输出；源码快照、构建及回归日志共用`perf_e43/validation/`。
+
+## device_prefix_dispatch撤回对照（2026-10-25）
+
+用户询问能否不加该分支及其性能影响。本轮在独立Python包中编译诊断版host dispatcher，复用E43已编译的device kernel对象；正式源码和扩展库保持E43版本。不能把原profiling中`aten::equal`约99–121μs直接当成撤回的净损失，因为恢复Host比较同时省去了第二个kernel提交、设备prefix扫描和general的Host准备。
+
+区分两个撤回范围：
+
+| 模式 | 设备paired选路 | Host.equal | general标量tiling/缓存 | 长full MHA分块路线 |
+|---|---|---|---|---|
+| current | 保留 | 普通eligible路径省去 | 保留 | 保留 |
+| host_equal | 取消 | 按原条件恢复 | 保留 | 保留 |
+| disabled | 取消 | 按原条件恢复 | 取消 | 取消 |
+
+`host_equal`恢复的是需要比较两份prefix时的Host判断；同Tensor、总T不同、已有直接general/short-query路线仍按对应条件选路。不能仅把`paired_prefix_dispatch`置false而继续跳过`equal`，否则同总T、不同Q/K分段会错误进入optimized。`disabled`把整个`device_prefix_dispatch`置false，因此测量的是三项组合撤回，也不是完整回退到E39。
+
+隔离probe确认：equal和同总T但unequal分段两类输入，current无`aten::equal`/`_local_scalar_dense`，另外两模式各出现一次；三模式out/dQ/dK/dV逐元素一致。正式诊断采用原五场景10项及E43可比D128泛化38项，同一输入/真实prefix、同一进程、同一二进制，分别对current与候选进行6轮AB/BA交替（正反顺序各3轮），每块预热10次、测量50次。切模式前同步NPU；B复用同一retained图，F+B每次新建图。CANN V3在每项后单独测F+B，仍用同源NPU int32 prefix，每次`.cpu()[1:]`的D2H包含在计时内。没有拿旧轮CANN耗时作为本次阈值分母。
+
+以下为**前反向总耗时**。几何增幅使用各项逐轮candidate/current比值中位数的几何均值；累计增幅为各项候选时延中位数之和/对应current时延中位数之和−1。正值表示撤回后变慢。
+
+| 范围 | 撤回方式 | 耗时几何增幅 | 累计耗时增幅 | 相对本轮CANN≥0.95 | 最低CANN/Flash |
+|---|---|---:|---:|---:|---:|
+| 原五场景10项 | 仅撤paired | +1.600% | +0.323% | 10/10 | 0.98271× |
+| 原五场景10项 | 整个开关关闭 | +1.615% | +0.333% | 10/10 | 0.98275× |
+| D128泛化38项 | 仅撤paired | +11.467% | +6.300% | 38/38 | 0.95927× |
+| D128泛化38项 | 整个开关关闭 | +14.612% | +11.701% | 36/38 | 0.85913× |
+
+原五场景累计增幅较小，主要因为耗时占比大的Encoder/Cross没有换路，不能据此判断短序列没有收益。Qwen3B仅撤paired后F+B增加5.43%–6.02%，Qwen4B增加4.05%–4.13%，约增加54–59μs；Decoder反而缩短约1.60%–1.65%。Encoder/Cross两种撤回模式下的配对变化均接近零，作为未换路的波动对照。泛化原paired路线32项仅撤paired后，逐项F+B增加2.29%–22.50%，增加时间的中位数约50.74μs。
+
+| 代表项 | dtype | 撤回方式 | 对应current μs | 撤回后 μs | 配对耗时变化 | CANN/撤回后 |
+|---|---|---|---:|---:|---:|---:|
+| MHA causal S64 | fp16 | 仅撤paired | 280.684 | 343.896 | +22.50% | 1.22025× |
+| MHA causal S128 | bf16 | 仅撤paired | 287.423 | 346.299 | +20.51% | 1.35920× |
+| MHA causal S4096 | fp16 | 仅撤paired | 1824.395 | 1876.545 | +2.79% | 1.00568× |
+| MHA full S4095 | fp16 | 仅撤paired | 2942.070 | 2942.432 | −0.002% | 1.02290× |
+| MHA full S4095 | fp16 | 整个开关关闭 | 2941.136 | 3503.305 | +19.12% | 0.85913× |
+| MHA full S4095 | bf16 | 整个开关关闭 | 2925.051 | 3411.419 | +16.65% | 0.90131× |
+| GQA4 cross Q129 K2049 | fp16 | 整个开关关闭 | 283.580 | 387.464 | +36.73% | 1.29189× |
+
+各时延列分别取中位数，配对变化取逐轮比值的中位数，两者不一定严格相除一致。`host_equal`最接近0.95门槛的是GQA4 full S2048 FP16（0.95927255×），因此本轮支持“可以只撤设备paired选路、保留其它优化，仍满足已测矩阵0.95目标”，但余量已变小，不能承诺逐项持平或未测shape达标。整个开关关闭则使MHA full S4095两dtype低于0.95，建议将设备选路、标量metadata优化与full MHA分块拆开评估。
+
+48/48项模式一致性诊断通过，检查out/dQ/dK/dV与current的差异（FP16 atol/rtol均0.005，BF16均0.05）；该检查**不是独立CPU双参考精度验收**，也没有改变正式benchmark的精度规则。本轮未修改正式实现，若实际删除路径，仍应对最终源码版本执行相应精度/兼容性回归。原CANN拒绝的Q1025/K513两项及D64/D256辅助项未进入本轮48项矩阵，排除原因与来源哈希明确保存；没有基于本轮速度筛选样本。
+
+[撤回对照汇总及逐项F+B](../../benchmark_results/device_prefix_ab/summary.md) · [完整B/F+B及原始AB/BA样本](../../benchmark_results/device_prefix_ab/measurements/results.json) · [诊断源码差异](../../benchmark_results/device_prefix_ab/validation/diagnostic.patch) · [复现命令](../../benchmark_results/device_prefix_ab/validation/run.sh) · [独立统计复核](../../benchmark_results/device_prefix_ab/validation/profile_review_audit.json)。

@@ -28,6 +28,7 @@
 #include "fag_common/common_header.h"
 #include "fag_common/cube_addr.h"
 #include "fag_common/vector_addr.h"
+#include "fag_common/prefix_route.hpp"
 using namespace Catlass;
 
 namespace FAG {
@@ -366,8 +367,21 @@ void FAGVarlenOpt(uint64_t fftsAddr,
         GM_ADDR out, GM_ADDR prefix, GM_ADDR cu_seq_qlen, 
         GM_ADDR cu_seq_kvlen, GM_ADDR q_start_idx, GM_ADDR kv_start_idx, 
         GM_ADDR dq, GM_ADDR dk, GM_ADDR dv, GM_ADDR alibi_slopes,
-        GM_ADDR workspace, GM_ADDR tiling_data, GM_ADDR ptrDump)
+        GM_ADDR workspace, GM_ADDR tiling_data, GM_ADDR ptrDump, bool checkEqualPrefix = false)
 {
+    if constexpr (inputLayout == InputLayout::TND) {
+        if (checkEqualPrefix) {
+            const auto* tiling = reinterpret_cast<__gm__ FAGv2TilingData*>(tiling_data);
+            // Every AIC/AIV observes the same immutable inputs and takes the
+            // same branch before initializing flags or writing workspace.
+            // General receives B cumulative endpoints (without leading zero).
+            // Compare those same B entries here, from the full B+1 prefixes.
+            if (!fag_route::EqualPrefixes(cu_seq_qlen + sizeof(int32_t),
+                                         cu_seq_kvlen + sizeof(int32_t), tiling->batch)) {
+                return;
+            }
+        }
+    }
     // Set FFTS address
     AscendC::SetSyncBaseAddr(fftsAddr);
 

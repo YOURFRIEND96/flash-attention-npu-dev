@@ -132,6 +132,28 @@ public:
         // Comparing its target segment avoids a modulo for every rectangle.
         const int32_t targetSegment = (roundId - 1) * coreNum + coreId;
         while (overFlag) {
+            // An empty batch owns no tiles. Preserve any partially filled
+            // segment while advancing, including through trailing empties.
+            if (s1BlockNum == 0 || s2BlockNum == 0) {
+                ++batchIdx;
+                if (batchIdx >= batch) {
+                    overFlag = 0;
+                    break;
+                }
+                nheadsIdx = 0;
+                qSeqIdx = 0;
+                seqKIdx = 0;
+                if constexpr (inputLayout == InputLayout::TND) {
+                    qSeqlen = getSeqLen(batchIdx);
+                    kSeqlen = qSeqlen;
+                }
+                s1BlockNum = (qSeqlen + 127) / 128;
+                s1TailLength = qSeqlen % 128;
+                s2BlockNum = (kSeqlen + 127) / 128;
+                s2TailLength = kSeqlen % 128;
+                s1GuardInterval = (s1BlockNum == 1) ? 1 : 2;
+                continue;
+            }
             if (SkipUnownedHeads<maskType>(*this, targetSegment)) {
                 // Complete-head skips preserve the existing segment boundary.
                 if (blockNum >= 15) {

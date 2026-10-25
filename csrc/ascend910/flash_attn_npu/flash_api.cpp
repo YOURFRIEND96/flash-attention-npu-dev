@@ -1467,14 +1467,35 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
         nheads == nheads_k && !deterministic && softcap == 0.0f && !has_alibi && p_dropout == 0.0f &&
         cu_seqlens_q.numel() - 1 >= 128 && max_seqlen_q > 4 &&
         max_seqlen_q <= 512 && max_seqlen_k <= 512;
+    // Decide from actual prefix contents on device, without returning a
+    // Tensor.equal boolean to the host. Keep extras and existing exclusive
+    // full-MHA dispatch intact. Neither totals nor maxima imply equal lengths.
+    const bool device_prefix_dispatch = !prefer_single_tile_full && !is_local &&
+        p_dropout == 0.0f && softcap == 0.0f && softmax_scale > 0.0f &&
+        !has_alibi && !deterministic && headdim == 128 &&
+        qsizes[0] > 0 && ksizes[0] > 0 && max_seqlen_q > 0 && max_seqlen_k > 0 &&
+        q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && out.is_contiguous() &&
+        dout.is_contiguous() && dq.is_contiguous() && dk.is_contiguous() && dv.is_contiguous() &&
+        seqlens_q.is_contiguous() && seqlens_k.is_contiguous() &&
+        seqlens_q.dim() == 1 && seqlens_k.dim() == 1 && seqlens_q.numel() > 1 &&
+        seqlens_q.device() == q.device() && seqlens_k.device() == q.device() &&
+        seqlens_q.scalar_type() == at::kInt && seqlens_k.scalar_type() == at::kInt &&
+        seqlens_q.numel() == seqlens_k.numel() &&
+        c10_npu::currentStreamCaptureStatusMayInitCtx() == c10_npu::CaptureStatus::None;
+    const bool paired_prefix_dispatch = device_prefix_dispatch && qsizes[0] == ksizes[0] &&
+        !seqlens_q.is_same(seqlens_k);
+    // Full MHA beyond one 512x512 CV tile benefits from the general
+    // kernel's balanced reuse of Q and KV, with fewer repeated dK/dV updates.
+    const bool prefer_multitile_full = device_prefix_dispatch && !local_is_causal && nheads == nheads_k &&
+        (max_seqlen_q > 512 || max_seqlen_k > 512);
     // varlen optimized kernel only supports headdim equal to 128
-    if (prefer_single_tile_full || is_local || p_dropout > 0.0f || headdim != 128 || qsizes[0] != ksizes[0] ||
-        (!seqlens_q.is_same(seqlens_k) && !seqlens_q.equal(seqlens_k))) {
+    if (prefer_single_tile_full || prefer_multitile_full || is_local || p_dropout > 0.0f || headdim != 128 || qsizes[0] != ksizes[0] ||
+        (!device_prefix_dispatch && !seqlens_q.is_same(seqlens_k) && !seqlens_q.equal(seqlens_k))) {
         float scale = softmax_scale > 0.f ? softmax_scale : (1.0f / sqrt(static_cast<float>(headdim)));
         return launch_fag_general(dout, q, k, v, out, softmax_lse, dq, dk, dv, seqlens_q, seqlens_k, max_seqlen_q,
                                   max_seqlen_k, scale, softcap, local_is_causal, local_window_size_left,
                                   local_window_size_right, deterministic, p_dropout, rng_state, alibi.ptr,
-                                  alibi.batchStride);
+                                  alibi.batchStride, device_prefix_dispatch);
     }
 
     // tiling args set
@@ -1560,8 +1581,8 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     if (is_causal) {
         attenMaskDevice = static_cast<uint8_t*>(const_cast<void*>(mask_gpu_tensor.storage().data()));
     }
-    auto cuSeqQlenDevice = static_cast<uint8_t*>(const_cast<void*>(seqlenq_gpu_tensor.storage().data()));
-    auto cuSeqKvlenDevice = static_cast<uint8_t*>(const_cast<void*>(seqlenk_gpu_tensor.storage().data()));
+    auto cuSeqQlenDevice = static_cast<uint8_t*>(const_cast<void*>(seqlenq_gpu_tensor.data_ptr()));
+    auto cuSeqKvlenDevice = static_cast<uint8_t*>(const_cast<void*>(seqlenk_gpu_tensor.data_ptr()));
     auto softMaxLseDevice = static_cast<uint8_t*>(const_cast<void*>(softmax_lse_kernel.storage().data()));
 
     auto workspaceDevice = static_cast<uint8_t*>(const_cast<void*>(workspace_tensor.storage().data()));
@@ -1596,10 +1617,20 @@ mha_varlen_bwd(const at::Tensor& dout,         // total_q x num_heads x head_siz
     vb_args.dvDevice = dvDevice;
     vb_args.workspaceDevice = workspaceDevice;
     vb_args.tilingDevice = tilingDevice;
+    vb_args.check_equal_prefix = paired_prefix_dispatch;
     if (vb_args.is_bf16) {
         launch_varlen_bwd_impl<bfloat16_t>(vb_args);
     } else {
         launch_varlen_bwd_impl<half>(vb_args);
+    }
+
+    if (paired_prefix_dispatch) {
+        // Complementary device guards ensure exactly one kernel writes the
+        // gradients. The general scheduler reads each real Q/K segment.
+        return launch_fag_general(dout, q, k, v, out, softmax_lse, dq, dk, dv, seqlens_q, seqlens_k,
+            max_seqlen_q, max_seqlen_k, softmax_scale, softcap, local_is_causal,
+            local_window_size_left, local_window_size_right, deterministic, p_dropout, rng_state,
+            alibi.ptr, alibi.batchStride, true, true, workspace_tensor);
     }
 
     auto opts = q.options();

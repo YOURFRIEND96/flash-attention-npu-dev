@@ -39,6 +39,9 @@ struct VarlenBwdLaunchArgs {
     uint8_t *alibiSlopesDevice;
     uint8_t *workspaceDevice;
     uint8_t *tilingDevice;
+    // Device-side routing for the paired optimized/general launch. Default
+    // preserves every existing caller, including non-paired eager calls.
+    bool check_equal_prefix = false;
 };
 
 // Per-dtype implementation, defined in autogen/varlen_bwd_dispatch_<dtype>.cpp.

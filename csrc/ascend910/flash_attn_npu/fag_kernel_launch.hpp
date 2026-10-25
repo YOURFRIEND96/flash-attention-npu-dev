@@ -58,7 +58,8 @@
                 a.outDevice, a.dropMaskDevice, a.attenMaskDevice, a.softMaxLseDevice,                \
                 a.cuSeqQlenDevice, a.cuSeqKvlenDevice,                                               \
                 nullptr, nullptr, a.dqDevice, a.dkDevice,                                            \
-                a.dvDevice, a.alibiSlopesDevice, a.workspaceDevice, a.tilingDevice);                  \
+                a.dvDevice, a.alibiSlopesDevice, a.workspaceDevice, a.tilingDevice,                  \
+                nullptr, a.skip_equal_prefix);                                                      \
     });
 
 #define FAG_BOOL_SWITCH(COND, CONST_NAME, ...)             \
