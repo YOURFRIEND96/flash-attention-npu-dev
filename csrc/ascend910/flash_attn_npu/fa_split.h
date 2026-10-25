@@ -26,6 +26,7 @@ inline uint32_t FaMax(uint32_t a, uint32_t b) { return a > b ? a : b; }
 
 inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
+    if (groupSize == 4 && qSeqlen > 128 && qSeqlen <= 512) return 4;
     uint32_t qRowNumCeil = Q_TILE_CEIL;
     uint32_t qNBlockTile = (qSeqlen != 0) ?
         (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
@@ -34,8 +35,9 @@ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
     return qNBlockTile;
 }
 
-inline uint32_t GetQSBlockTile(int64_t kvSeqlen)
+inline uint32_t GetQSBlockTile(int64_t kvSeqlen, uint32_t groupSize, uint32_t qSeqlen)
 {
+    if (groupSize == 4 && qSeqlen > 128 && qSeqlen <= 512) return 32;
     uint32_t qSBlockTile = Q_TILE_CEIL;
     return qSBlockTile;
 }
@@ -85,7 +87,7 @@ inline BatchParams getBatchParams(uint32_t bIdx, uint32_t groupSize, const Split
     p.curQNBlockTile = GetQNBlockTile(p.qSeqlen, groupSize);
     p.qNBlockNumPerGroup = (groupSize + p.curQNBlockTile - 1) / p.curQNBlockTile;
     p.curQNBlockNum = p.qNBlockNumPerGroup * ctx.num_heads_k;
-    p.curQSBlockTile = GetQSBlockTile(p.kvSeqlen);
+    p.curQSBlockTile = GetQSBlockTile(p.kvSeqlen, groupSize, p.qSeqlen);
     p.curQSBlockNum = (p.qSeqlen + p.curQSBlockTile - 1) / p.curQSBlockTile;
     p.curKSBlockTile = GetKSBlockTile(p.kvSeqlen);
     // Per-phase S2 block count: old blocks + new blocks

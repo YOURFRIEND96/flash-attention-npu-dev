@@ -65,6 +65,7 @@ struct FAGTilingData {
 
     bool isSparse;
     bool isDeterministic;
+    bool exclusiveGradOutput = false;
     uint32_t tmpBufferSize = 0;
 
     // pre TilingData

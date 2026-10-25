@@ -6,6 +6,7 @@
 #include "catlass/catlass.hpp"
 #include "kernel_operator.h"
 #include "tiling/platform/platform_ascendc.h"
+#include "device_triu_mask.h"
 #include "../flash_attn_npu_3/fag_tiling.h"
 #include "../flash_attn_npu_3/fag_tiling.cpp"
 #include "runtime/rt_ffts.h"
@@ -171,9 +172,7 @@ std::vector<at::Tensor> launch_fag_general(
 
     at::Tensor mask_gpu_tensor;
     if (has_attn_mask) {
-        const int64_t mask_dim = FAGTiling::ATTEN_MASK_COMPRESS_DIM;
-        mask_gpu_tensor = at::triu(
-            at::ones({mask_dim, mask_dim}, at::device(at::kPrivateUse1).dtype(at::kByte)), 1);
+        mask_gpu_tensor = MakeDeviceTriuMask();
     }
 
     uint64_t fftsAddr{0};

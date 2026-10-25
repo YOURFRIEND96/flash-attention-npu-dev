@@ -209,14 +209,20 @@ public:
                     (__gm__ ElementA2*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB2*)(params.k),
                     (__gm__ float*)(params.workspace + dqWorkSpaceOffset), 
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B);
-                WaitFlag();
-                SetFlag();
+                // Cube3 loads both L0B halves as one resident operand. Drain
+                // both prior Cube2 consumers, but preserve the L1/L0A slot
+                // dependencies so its next loads can overlap with Cube2.
+                AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID5);
+                AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID6);
+                AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID5);
+                AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID6);
                 blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2],
                     (__gm__ ElementA3*)(params.workspace + pWorkSpaceOffset), (__gm__ ElementB3*)(params.dout),
                     (__gm__ float*)(params.workspace + dvWorkSpaceOffset), 
                     pingpongFlagL1A, pingpongFlagL0A, pingpongFlagL1B, pingpongFlagL0B, pingpongFlagC);
-                WaitFlag();
-                SetFlag();
+                // dV and dK use the same Cube3 buffer/event ownership. Keep
+                // the ping-pong pipeline live between them, as in the arch22
+                // basic gradient kernel; Cube3 waits before reusing each slot.
                 blockMmadFAGCube3(cubeAddrInfo[(taskId - 1) % 2],
                     (__gm__ ElementA3*)(params.workspace + dsWorkSpaceOffset), (__gm__ ElementB3*)(params.q),
                     (__gm__ float*)(params.workspace + dkWorkSpaceOffset), 

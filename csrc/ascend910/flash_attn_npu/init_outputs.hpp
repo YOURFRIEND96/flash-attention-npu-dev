@@ -72,7 +72,12 @@ class BlockEpilogue<EpilogueAtlasA2InitOutWhenZero<LSE_MODE_>, AttnOutType_, Lse
             AscendC::Duplicate(lseOutUbTensor, LSE_OUT_INI, count);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
-            AscendC::DataCopyPad(gLse, lseOutUbTensor, AscendC::DataCopyExtParams(1, count * sizeof(float), 0, 0, 0));
+            // A grouped task may own only part of each head's token range.
+            // NT heads stride by total tokens, not by this task's row count.
+            for (uint32_t head = 0; head < qNThisSubBlock; ++head) {
+                AscendC::DataCopyPad(gLse[head * layoutLse.stride(0)], lseOutUbTensor,
+                    AscendC::DataCopyExtParams(1, qSThisSubBlock * sizeof(float), 0, 0, 0));
+            }
         }
         AscendC::PipeBarrier<PIPE_ALL>();
     }

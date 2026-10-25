@@ -105,7 +105,15 @@ public:
                 guardLen = qSeqIdx + s1GuardInterval - seqKIdx;
             }
             int32_t reserve = limit - blockNum;
-            int32_t realLenAlign = (reserve + s1GuardInterval - 1) / s1GuardInterval;
+            // Full attention stores every tile in the rectangle. Rounding
+            // up can pack 17 tiles into the 16-tile workspace when reserve
+            // is odd. Only causal rectangles omit the upper-right tile.
+            int32_t realLenAlign;
+            if constexpr (maskType == MaskType::NO_MASK) {
+                realLenAlign = reserve / s1GuardInterval;
+            } else {
+                realLenAlign = (reserve + s1GuardInterval - 1) / s1GuardInterval;
+            }
             if (realLenAlign >= guardLen) {
                 if (coreSegmentBlockNum % coreNum == coreId) {
                     int32_t index = globalCubeAddr->blockLength;

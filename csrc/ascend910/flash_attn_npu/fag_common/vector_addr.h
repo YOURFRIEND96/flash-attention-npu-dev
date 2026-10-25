@@ -138,7 +138,15 @@ public:
             }
             int32_t reserve = limit - blockNum;
 
-            int32_t realLenAlign = (reserve + s1GuardInterval - 1) / s1GuardInterval;
+            // Match CubeAddr's rectangular footprint. Unlike causal mode,
+            // full attention cannot use a missing corner to fit an extra
+            // tile into the fixed 16-entry VecBlkInfo/workspace segment.
+            int32_t realLenAlign;
+            if constexpr (maskType == MaskType::NO_MASK) {
+                realLenAlign = reserve / s1GuardInterval;
+            } else {
+                realLenAlign = (reserve + s1GuardInterval - 1) / s1GuardInterval;
+            }
             if (realLenAlign >= guardLen) {
                 if (coreSegmentBlockNum % coreNum == coreId) {
                     int32_t blockId = blockNum;

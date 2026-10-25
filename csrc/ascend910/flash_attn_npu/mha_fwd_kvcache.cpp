@@ -369,7 +369,7 @@ class FAInferKernel {
                 uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
                 uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
                 uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
-                uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur);
+                uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur, groupSize, qSeqlenCur);
                 uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
                 uint32_t curKSBlockNumTmp = CeilDiv(kvSeqlenCur, MAX_KV_STACK_LEN);
                 if (kvNewSeqlen != 0U) {
@@ -449,7 +449,7 @@ class FAInferKernel {
                     uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenTmp, groupSize);
                     uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
                     uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
-                    uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenTmp);
+                    uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenTmp, groupSize, qSeqlenTmp);
                     uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenTmp, curQSBlockTileTmp);
                     curTotalTaskNumTmp += curQNBlockNumTmp * curQSBlockNumTmp;
                 }
@@ -464,7 +464,7 @@ class FAInferKernel {
                     uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
                     uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
                     curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
-                    curQSBlockNumCur = CeilDiv(qSeqlenCur, 128);
+                    curQSBlockNumCur = CeilDiv(qSeqlenCur, GetQSBlockTile(0, groupSize, qSeqlenCur));
                     cachedBatch = curBatchTmp;
                 }
 
@@ -573,7 +573,7 @@ class FAInferKernel {
         // total S = old + new
         // TODO: modify to constexpr, change appendKVFlag to template param
         uint32_t kvSeqlenOld;
-        if (INPUT_LAYOUT == FaiKenel::inputLayout::TND || appendKVFlag || PAGED_CACHE_FLAG) {
+        if (appendKVFlag || PAGED_CACHE_FLAG) {
             kvSeqlenOld = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
         } else {
             kvSeqlenOld = maxKvSeqlen;
@@ -586,13 +586,11 @@ class FAInferKernel {
             prevQSeqlenSum = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx));
             qSeqlen = static_cast<uint32_t>(gActualQseqlen.GetValue(BIdx + 1)) - prevQSeqlenSum;
             if constexpr (!PAGED_CACHE_FLAG) {
-                // gActualKvseqlen holds prefix sums; append uses the capacity-aligned
-                // per-batch cache layout, so the offset is kvCacheSeqlen-stepped.
-                kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx + 1)) -
-                           static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
+                // Reuse the actual prefix read, including for ragged batches.
+                const uint32_t kvPrefix = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
+                kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx + 1)) - kvPrefix;
+                prevKvSeqlenSum = appendKVFlag ? BIdx * kvCacheSeqlen : kvPrefix;
                 kvSeqlenOld = kvSeqlen;
-                prevKvSeqlenSum =
-                    appendKVFlag ? BIdx * kvCacheSeqlen : static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
             }
         } else {
             // BSND: Q/O/LSE per-batch storage step is maxQSeqlen.
@@ -651,7 +649,7 @@ class FAInferKernel {
 
         uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
         uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
-        uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen);
+        uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen, groupSize, qSeqlen);
         uint32_t curQSBlockNum = CeilDiv(qSeqlen, curQSBlockTile);
         uint32_t curKSBlockNum = CeilDiv(kvSeqlen, MAX_KV_STACK_LEN);
         if (appendKVFlag) {
@@ -792,7 +790,6 @@ class FAInferKernel {
         uint32_t preKVNum = PRE_LAUNCH;
         uint32_t blockStackNum = (MAX_KV_STACK_LEN - 1 + pagedBlockSize) / pagedBlockSize;
         uint32_t stackSeqTile = MAX_KV_STACK_LEN;
-        uint32_t stackSeqTilePad = MAX_KV_STACK_LEN;
         uint32_t taskStackCount = 0;
 
         const bool isEmptyTask = kvStart >= kvEnd;
@@ -878,7 +875,7 @@ class FAInferKernel {
                 uint64_t gmOffsetS = static_cast<uint64_t>(coreIdx * WORKSPACE_BLOCK_SIZE_DB * STACK_SLOTS +
                                                            curStackTileMod * WORKSPACE_BLOCK_SIZE_DB);
                 GemmCoord actualBlockShapeQK{rowNum, desc.stackSeqTile, embed};
-                LayoutS layOutS(rowNum, desc.stackSeqTile, stackSeqTilePad);
+                LayoutS layOutS(rowNum, desc.stackSeqTile, MAX_KV_STACK_LEN);
 #ifdef __DAV_C220_CUBE__
                 // Newkv blocks read the contiguous k_new tensor and write back
                 // into the cache (page-addressed when paged); old blocks read
@@ -900,7 +897,7 @@ class FAInferKernel {
                 Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);
 #endif
 #ifdef __DAV_C220_VEC__
-                LayoutP layOutP(rowNum, desc.stackSeqTile, stackSeqTilePad);
+                LayoutP layOutP(rowNum, desc.stackSeqTile, MAX_KV_STACK_LEN);
                 LayoutMask layOutMask(COMP_TRIU_MASK_DIM_LEN, COMP_TRIU_MASK_DIM_LEN);
                 uint64_t gmOffsetP = gmOffsetS;
                 uint32_t kvSStartIdx =
@@ -1024,7 +1021,7 @@ class FAInferKernel {
                 LayoutOTmp layoutOTmp(pvDesc.rowNum, embedV, embedRoundV);
 #ifdef __DAV_C220_CUBE__
                 auto gPVSrc = pvDesc.isAppendBlock ? gVNew : gV;
-                LayoutP layoutPTemp(pvDesc.rowNum, pvDesc.stackSeqTile, stackSeqTilePad);
+                LayoutP layoutPTemp(pvDesc.rowNum, pvDesc.stackSeqTile, MAX_KV_STACK_LEN);
                 uint64_t gmOffsetP =
                     coreIdx * WORKSPACE_BLOCK_SIZE_DB * STACK_SLOTS + pvDesc.slot * WORKSPACE_BLOCK_SIZE_DB;
                 if constexpr (PAGED_CACHE_FLAG) {
@@ -1075,7 +1072,9 @@ class FAInferKernel {
                         layoutO, layoutOTmp, layoutUpdate, layoutLse, actualBlockShapePV, pvReady, pvDesc.qSBlockSize,
                         pvDesc.qNBlockSize, oHeadStride, pvDesc.firstStack, pvDesc.lastStack, pvDesc.slot,
                         pvDesc.taskStateSlot, typename EpilogueRescaleO::SplitKVParams(), pvDesc.invalidSuffixStartRow,
-                        pvDesc.invalidPrefixEndRow, pvDesc.qSeqlen, pvDesc.qSBlockIdx, pvDesc.curQNBlockTile);
+                        pvDesc.invalidPrefixEndRow, pvDesc.qSeqlen,
+                        pvDesc.qSBlockIdx * GetQSBlockTile(maxKvSeqlen, groupSize, pvDesc.qSeqlen),
+                        pvDesc.curQNBlockTile);
                 }
 #endif
             }

@@ -32,12 +32,7 @@ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 
 inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
-    uint32_t qNBlockTile = (qSeqlen != 0)
-        ? (Q_TILE_CEIL / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER
-        : Q_TILE_CEIL;
-    qNBlockTile = qNBlockTile < groupSize ? qNBlockTile : groupSize;
-    qNBlockTile = qNBlockTile < 1u ? 1u : qNBlockTile;
-    return qNBlockTile;
+    return fa_split::GetQNBlockTile(qSeqlen, groupSize);
 }
 }
 
@@ -142,7 +137,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
         const uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
         const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
-        const uint32_t curQSBlockTile = Q_TILE_CEIL;
+        const uint32_t curQSBlockTile = fa_split::GetQSBlockTile(maxKvSeqlen, groupSize, qSeqlen);
         const uint32_t curQSBlockNum = CeilDiv(qSeqlen, curQSBlockTile);
         const uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
         if (batchIdx == 0) {

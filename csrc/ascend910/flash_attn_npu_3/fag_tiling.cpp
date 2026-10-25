@@ -419,6 +419,18 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
     fagTilingData.s1Outer = (fagTilingData.qSeqlen + fagTilingData.s1CvInner - 1) / fagTilingData.s1CvInner;
     fagTilingData.s2Outer = (fagTilingData.kvSeqlen + fagTilingData.s2CvInner - 1) / fagTilingData.s2CvInner;
 
+    // Full MHA in one CV tile has exactly one writer per gradient
+    // element. Empty/used-length, GQA and deterministic paths retain zero+add.
+    fagTilingData.exclusiveGradOutput = fagTilingData.layoutType == TND &&
+        fagTilingData.maskType == static_cast<uint32_t>(MaskType::NO_MASK) &&
+        !fagTilingData.isDeterministic && fagTilingData.g == 1 &&
+        fagTilingData.s1Outer == 1 && fagTilingData.s2Outer == 1 &&
+        fagInfo.qUsedLenList == nullptr && fagInfo.kvUsedLenList == nullptr &&
+        std::all_of(fagTilingData.actualSeqQlen.begin(), fagTilingData.actualSeqQlen.end(),
+                    [](int32_t n) { return n > 0; }) &&
+        std::all_of(fagTilingData.actualSeqKvlen.begin(), fagTilingData.actualSeqKvlen.end(),
+                    [](int32_t n) { return n > 0; });
+
     uint32_t s1TailTmp = fagTilingData.qSeqlen % fagTilingData.s1Inner;
     uint32_t s1CvTailTmp = fagTilingData.qSeqlen % fagTilingData.s1CvInner;
     uint32_t s2TailTmp = fagTilingData.kvSeqlen % fagTilingData.s2Inner;

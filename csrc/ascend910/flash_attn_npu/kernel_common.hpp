@@ -7,11 +7,13 @@
 #ifndef KERNEL_COMMON
 #define KERNEL_COMMON
 
+#include "fa_pipeline.h"
+
 namespace KernelCommon {
 constexpr uint32_t QK_READY_ID = 1;
 constexpr uint32_t SOFTMAX_READY_ID = 2;
 constexpr uint32_t PV_READY_ID = 3;
-constexpr uint32_t PRE_LAUNCH = 2;
+constexpr uint32_t PRE_LAUNCH = fa_pipeline::PRE_LAUNCH;
 constexpr uint32_t N_SPLIT_HELPER = 2;
 constexpr uint32_t MAX_KV_STACK_LEN = 512;
 constexpr uint32_t Q_TILE_CEIL = 128;
@@ -90,14 +92,16 @@ struct FAIKernelParams {
 
 __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
+    if (groupSize == 4 && qSeqlen > 128 && qSeqlen <= 512) return 4;
     uint32_t qNBlockTile = (qSeqlen != 0) ? (Q_TILE_CEIL / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
     qNBlockTile = qNBlockTile < groupSize ? qNBlockTile : groupSize;
     qNBlockTile = qNBlockTile < 1 ? 1 : qNBlockTile;
     return qNBlockTile;
 }
 
-__aicore__ inline uint32_t GetQSBlockTile(uint32_t kvSeqlen)
+__aicore__ inline uint32_t GetQSBlockTile(uint32_t kvSeqlen, uint32_t groupSize, uint32_t qSeqlen)
 {
+    if (groupSize == 4 && qSeqlen > 128 && qSeqlen <= 512) return 32;
     uint32_t qSBlockTile = Q_TILE_CEIL;
     return qSBlockTile;
 }

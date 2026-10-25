@@ -7,6 +7,7 @@
 #ifndef CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_RESCALE_O_NO_SPLIT_ROW_HPP_T
 #define CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_RESCALE_O_NO_SPLIT_ROW_HPP_T
 
+#include "fa_pipeline.h"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
@@ -54,7 +55,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
     static constexpr uint32_t VECTOR_SIZE = 128;
     static constexpr uint32_t NUM4 = 4;
     static constexpr uint32_t MAX_UB_O_ELEM_NUM = 8192;
-    static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
+    // Q tiles contain at most 128 rows, split across two Vector cores.
+    static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 64;
     static constexpr uint32_t SIZE_OF_16BIT = 2;
 
     // Scalar + broadcast LSE: [177920, 180224), between live DM rows and raw masks.
@@ -84,9 +86,9 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
         constexpr uint32_t GM_UB_TENSOR_OFFSET =
             10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t GL_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + (2 + fa_pipeline::SLOTS) * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + (2 + 2 * fa_pipeline::SLOTS) * REPEAT_SIZE_IN_BYTE;
 
         dropoutValue = dropoutValue_;
 
@@ -98,7 +100,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GO_UB_TENSOR_OFFSET);
         hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
-        static_assert(DM_UB_TENSOR_OFFSET + (2 * MAX_ROW_NUM_SUB_CORE + FLOAT_VECTOR_SIZE) * sizeof(float) <=
+        static_assert(DM_UB_TENSOR_OFFSET + (fa_pipeline::SLOTS * MAX_ROW_NUM_SUB_CORE) * sizeof(float) <=
                           LSE_STAGING_UB_OFFSET,
                       "LSE staging overlaps live DM rows");
         lseStagingUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_STAGING_UB_OFFSET);
@@ -123,7 +125,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
     }
 
     __aicore__ inline void InvalidLineLSEProcess(uint32_t qNThisSubBlock, int32_t invalidSuffixStartRow,
-                                                 uint32_t qSBlockIdx, uint32_t inRowOffsetThisSubBlock,
+                                                 uint32_t qTokenStart, uint32_t inRowOffsetThisSubBlock,
                                                  uint32_t totalRowNum, int32_t invalidPrefixEndRow, uint32_t qSeqlen,
                                                  uint32_t qSThisSubBlock,
                                                  const AscendC::LocalTensor<float>& lseUbTensor)
@@ -134,7 +136,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
         const uint32_t headCount = qNThisSubBlock == 0U ? 1U : qNThisSubBlock;
         const uint32_t rowsPerHead = qNThisSubBlock == 0U ? totalRowNum : qSThisSubBlock;
         const int64_t tokenStart =
-            static_cast<int64_t>(qSBlockIdx) * VECTOR_SIZE + (qNThisSubBlock == 0U ? inRowOffsetThisSubBlock : 0U);
+            static_cast<int64_t>(qTokenStart) + (qNThisSubBlock == 0U ? inRowOffsetThisSubBlock : 0U);
         uint64_t headMask = 0;
         if (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != qSeqlen && invalidPrefixEndRow > tokenStart) {
             const uint32_t prefixRows = AscendC::Std::min(static_cast<int64_t>(rowsPerHead),
@@ -157,6 +159,10 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
         uint64_t mask[2] = {invalidMask, 0};
         AscendC::Duplicate<float>(lseUbTensor, LSE_OUT_INI, mask, 1, 1, 8);
         AscendC::PipeBarrier<PIPE_V>();
+        // Later softmax/mask conversion instructions use isSetMask=false.
+        // Restore explicitly; an optional LSE broadcast must not own this
+        // state transition as its Brcb implementation happens to ResetMask.
+        AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     }
 
     __aicore__ inline void ClearInvalidOutputRows(uint32_t ubRowOffset, uint32_t tokenStart, uint32_t tokenNum,
@@ -269,14 +275,17 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                    uint32_t taskStateSlot, uint32_t needRowLoop, uint32_t isLastRowLoop, uint32_t rowOffsetLoop,
                    uint32_t proTokenIdx, uint32_t proTokenNum, uint32_t epiTokenNum, uint32_t integralHeadNum,
                    const SplitKVParams& splitParams, uint32_t rowOffsetCurLoop, int32_t invalidSuffixStartRow,
-                   int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSBlockIdx, uint32_t rowNum,
+                   int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qTokenStart, uint32_t rowNum,
                    uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile, uint64_t oHeadStride)
     {
         uint32_t curRowNum = layoutInput.shape(0);
         uint32_t embed = layoutInput.shape(1);
         uint32_t embedRound = layoutInput.stride(0);
         uint32_t curRowNumRound = RoundUp(curRowNum, FLOAT_BLOCK_SIZE);
-        uint32_t qSBlockSize = layoutOutput.shape(0);
+        // layoutOutput describes the entire sequence, while this task may own
+        // only a token tile. In particular, grouped-head tail LSE copies must
+        // never use the full sequence length as their per-head copy extent.
+        uint32_t qSBlockSize = qSThisSubBlock;
         uint32_t oHiddenSize = layoutOutput.shape(1);
         uint32_t qHeads = layoutLse.shape(0);
         uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;
@@ -346,15 +355,20 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
         }
 
         if (isLastStackTile) {
-            // *** gl_block = expand_to_block(gl)
+            // Compute one row reciprocal with Div (not approximate
+            // Reciprocal), then reuse it for all output channels.
+            AscendC::Duplicate(hmUbTensor, 1.0f, curRowNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Div(hmUbTensor, hmUbTensor, glUbTensor[stateRowOffset], curRowNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Brcb(tvUbTensor.ReinterpretCast<uint32_t>(),
-                          glUbTensor.ReinterpretCast<uint32_t>()[stateRowOffset], curRowNumRound / FLOAT_BLOCK_SIZE,
+                          hmUbTensor.ReinterpretCast<uint32_t>(), curRowNumRound / FLOAT_BLOCK_SIZE,
                           AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();
             // *** go = go / gl_block
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             for (uint32_t vdiv_idx = 0; vdiv_idx < embed / FLOAT_VECTOR_SIZE; ++vdiv_idx) {
-                AscendC::Div<float, false>(goUbTensor32[vdiv_idx * FLOAT_VECTOR_SIZE],
+                AscendC::Mul<float, false>(goUbTensor32[vdiv_idx * FLOAT_VECTOR_SIZE],
                                            goUbTensor32[vdiv_idx * FLOAT_VECTOR_SIZE], tvUbTensor, (uint64_t)0,
                                            curRowNum,
                                            AscendC::BinaryRepeatParams(1, 1, 0, embedRound / FLOAT_BLOCK_SIZE,
@@ -362,7 +376,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
             }
             if (embed % FLOAT_VECTOR_SIZE > 0) {
                 SetMask(embed % FLOAT_VECTOR_SIZE);
-                AscendC::Div<float, false>(goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
+                AscendC::Mul<float, false>(goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE],
                                            goUbTensor32[embed / FLOAT_VECTOR_SIZE * FLOAT_VECTOR_SIZE], tvUbTensor,
                                            (uint64_t)0, curRowNum,
                                            AscendC::BinaryRepeatParams(1, 1, 0, embedRound / FLOAT_BLOCK_SIZE,
@@ -395,17 +409,17 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                         AscendC::UnaryRepeatParams(1, 1, 4, 8));
                 }
             }
-            uint32_t rowStart = qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop;
+            uint32_t rowStart = qTokenStart + rowOffsetCurLoop;
             uint32_t subBlockStart = (qNThisSubBlock == 0U)
                                          ? rowStart
-                                         : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
+                                         : (qTokenStart + rowOffsetLoop % qSThisSubBlock);
             if (!splitParams.isSplitkv) {
                 if (qNThisSubBlock == 0U) {
                     ClearInvalidOutputRows(0U, rowStart, curRowNum, invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen,
                                            embedRound);
                 } else {
                     uint32_t innerGOUbRowOffset = 0U;
-                    uint32_t qBlockStart = qSBlockIdx * VECTOR_SIZE;
+                    uint32_t qBlockStart = qTokenStart;
                     if (proTokenNum != 0U) {
                         ClearInvalidOutputRows(innerGOUbRowOffset, subBlockStart, proTokenNum, invalidSuffixStartRow,
                                                invalidPrefixEndRow, qSeqlen, embedRound);
@@ -449,12 +463,12 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                                                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
 
-                    InvalidLineLSEProcess(qNThisSubBlock, invalidSuffixStartRow, qSBlockIdx, inRowOffsetThisSubBlock,
+                    InvalidLineLSEProcess(qNThisSubBlock, invalidSuffixStartRow, qTokenStart, inRowOffsetThisSubBlock,
                                           totalRowNum, invalidPrefixEndRow, qSeqlen, qSThisSubBlock, lseUbTensor);
-                    AscendC::Brcb(lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
-                                  lseUbTensor.ReinterpretCast<uint32_t>(), CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
-                                  AscendC::BrcbRepeatParams(1, 8));
-                    if (!splitParams.isSplitkv) {
+                    if (splitParams.isSplitkv) {
+                        AscendC::Brcb(lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
+                                     lseUbTensor.ReinterpretCast<uint32_t>(), CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
+                                     AscendC::BrcbRepeatParams(1, 8));
                         AscendC::PipeBarrier<PIPE_V>();
                     }
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
@@ -561,7 +575,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                uint32_t qSBlockSize, uint32_t qNBlockSize, uint64_t oHeadStride, uint32_t isFirstStackTile,
                uint32_t isLastStackTile, uint32_t curStackTileMod, uint32_t taskStateSlot,
                const SplitKVParams& splitParams = SplitKVParams(), int32_t invalidSuffixStartRow = 0,
-               int32_t invalidPrefixEndRow = 0, uint32_t qSeqlen = 0, uint32_t qSBlockIdx = 0,
+               int32_t invalidPrefixEndRow = 0, uint32_t qSeqlen = 0, uint32_t qTokenStart = 0,
                uint32_t curQNBlockTile = 1)
     {
         uint32_t rowNum = actualBlockShape.m();
@@ -677,7 +691,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>, Ou
                                qSThisSubBlock, inRowActualThisSubBlock, isFirstStackTile, isLastStackTile,
                                curStackTileMod, taskStateSlot, needRowLoop, (rowLoopIdx == rowLoop - 1U), rowOffsetLoop,
                                proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum, blockParams, rowOffsetCurLoop,
-                               invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, qSBlockIdx, rowNum,
+                               invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, qTokenStart, rowNum,
                                inRowOffsetThisSubBlock, curQNBlockTile, oHeadStride);
             }
         }

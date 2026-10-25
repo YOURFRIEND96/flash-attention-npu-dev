@@ -149,6 +149,7 @@ public:
         s2CvInner = fagTilingData->s2CvInner;
         s2CvTail = s2 - (s2Outer - 1) * s2CvInner;
         cubeBaseMN = s1CvInner * s2CvInner;
+        exclusiveGradOutput = fagTilingData->exclusiveGradOutput;
 
         actual_seq_qlen_addr = params.cu_seq_qlen;
         actual_seq_kvlen_addr = params.cu_seq_kvlen;
@@ -271,6 +272,35 @@ public:
 
     __aicore__ inline bool CalcValidBlock(int64_t& baseIdx, int64_t& startCoreId, DBParams& dbParam)
     {
+        if constexpr (INPUT_LAYOUT == TND && IS_ATTEN_MASK != ENABLE && IS_DTM != ENABLE) {
+            if (s1 <= s1CvInner && s2 <= s2CvInner) {
+                // One tile per (batch, KV head, group): locate this core's task
+                // directly instead of walking all other cores' tasks. Empty
+                // sequences retain a pipeline slot to preserve task parity.
+                const int64_t task = baseIdx + cCubeBlockIdx;
+                const int64_t count = b * n2 * g;
+                if (baseIdx < 0 || task >= count) {
+                    dbParam.blockId = -1;
+                } else {
+                    dbParam.bIdx = task / (n2 * g);
+                    dbParam.n2Idx = (task % (n2 * g)) / g;
+                    dbParam.gIdx = task % g;
+                    dbParam.s1oIdx = 0;
+                    dbParam.s2oIdx = 0;
+                    GetSeqQlenKvlenByBidx(dbParam.bIdx, cachedActualSeqQlen, cachedActualSeqKvlen);
+                    dbParam.blockId = cachedActualSeqQlen > 0 && cachedActualSeqKvlen > 0 ? task : -1;
+                    dbParam.s1CvExtend = cachedActualSeqQlen;
+                    dbParam.s2CvExtend = cachedActualSeqKvlen;
+                    dbParam.s1CvExtendAlign = (cachedActualSeqQlen + 15) / 16 * 16;
+                    dbParam.s2CvExtendAlign = (cachedActualSeqKvlen + 15) / 16 * 16;
+                }
+                if (baseIdx >= 0) {
+                    baseIdx += cubeCoreNum;
+                    if (baseIdx >= count) baseIdx = -1;
+                }
+                return true;
+            }
+        }
         if (bDimIdx >= b) { // 越界情形
             if (cCubeBlockIdx >= startCoreId) {
                 dbParam.blockId = -1; // 没有数据需要处理
@@ -543,7 +573,7 @@ public:
                     keyGm[dbParam.bTensorOffsetCv],
                     dqWorkSpaceGm[dqOffset],
                     layoutA1, layoutB1, layoutC1,
-                    actualBlockShape1, true);
+                    actualBlockShape1, !exclusiveGradOutput);
         }
 
         // dq GM write done; blockMmad3 reuses same L1
@@ -559,7 +589,7 @@ public:
         blockMmad3(mulWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
                 queryGm[dbParam.aTensorOffsetCv],
                 dkWorkSpaceGm[dkvOffset], layoutA2, layoutB2, layoutC2,
-                actualBlockShape2, true);
+                actualBlockShape2, !exclusiveGradOutput);
 
         AscendC::PipeBarrier<PIPE_MTE3>();
 
@@ -574,7 +604,7 @@ public:
         blockMmad3(dropWorkSpaceGm[pingpongIdx * cubeBaseMN * 2],
                 dxGm[dbParam.aTensorOffsetCv / d * value_d],
                 dvWorkSpaceGm[dvOffset], layoutA3, layoutB3, layoutC3,
-                actualBlockShape3, true);
+                actualBlockShape3, !exclusiveGradOutput);
     }
 
 
@@ -777,8 +807,10 @@ public:
     {
         // pre compute
         AscendC::TPipe pipePre;
-        EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.drop_mask, params.workspace, params.tiling);
-        epilogueFagPre();
+        if (!reinterpret_cast<__gm__ FAGTilingData*>(params.tiling)->exclusiveGradOutput) {
+            EpilogueFAGPre epilogueFagPre(resource, &pipePre, params.dq, params.dk, params.dv, params.drop_mask, params.workspace, params.tiling);
+            epilogueFagPre();
+        }
         pipePre.Destroy();
 
         // vec SoftmaxGrad
@@ -870,6 +902,7 @@ private:
     static constexpr uint64_t SYNC_C1_V1_FLAG[3] = {1, 2, 3};
     static constexpr uint64_t SYNC_C2_V1_FLAG[3] = {7, 8, 9};
     int64_t blockStartIdx = 0;
+    bool exclusiveGradOutput = false;
     DBParams dbParams[3];
     // base info
     int64_t bDimIdx{0};

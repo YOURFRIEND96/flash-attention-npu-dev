@@ -277,7 +277,12 @@ namespace Catlass::Gemm::Block
                             if (out_c) {
                                 unit_flag = 0b11;
                             }
-                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, real_n, l1_k_size, real_m,
+                            // A single KV row must still use GEMM: the L0 operands
+                            // have matrix layouts, not the vector layout required
+                            // by the hardware's M=1 GEMV mode. Match Cube1/Cube2;
+                            // the store below continues to write only real_n rows.
+                            uint16_t m_modify = (real_n == 1) ? 2 : real_n;
+                            tileMmad(*l0_c_buf_tensor, *l0_a_buf_tensor, *l0_b_buf_tensor, m_modify, l1_k_size, real_m,
                                 init_c, unit_flag);
                         }
 

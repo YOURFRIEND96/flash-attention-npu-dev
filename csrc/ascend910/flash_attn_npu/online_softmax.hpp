@@ -7,6 +7,7 @@
 #ifndef CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_ONLINE_SOFTMAX_NO_MASK_HPP_T
 #define CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_ONLINE_SOFTMAX_NO_MASK_HPP_T
 
+#include "fa_pipeline.h"
 #include "catlass/catlass.hpp"
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
@@ -61,9 +62,10 @@ public:
     static constexpr uint32_t REDUCE_UB_SIZE = 1024;
     static constexpr uint32_t ROW_OPS_SPEC_MASK_32 = 32;
     static constexpr uint32_t ROW_OPS_SPEC_MASK_4 = 4;
-    static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
+    // Q tiles contain at most 128 rows, split across two Vector cores.
+    static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 64;
     static constexpr int64_t UB_FLOAT_LINE_SIZE = 64;
-    static constexpr uint32_t TASK_STATE_SLOTS = 3;
+    static constexpr uint32_t TASK_STATE_SLOTS = fa_pipeline::SLOTS;
     static constexpr uint32_t TASK_GM_UB_TENSOR_OFFSET =
         11 * UB_UINT8_BLOCK_SIZE + 4 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
     static constexpr uint32_t TASK_GL_UB_TENSOR_OFFSET =
@@ -96,9 +98,9 @@ public:
         constexpr uint32_t GM_UB_TENSOR_OFFSET =
             10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t GL_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + (2 + fa_pipeline::SLOTS) * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + (2 + 2 * fa_pipeline::SLOTS) * REPEAT_SIZE_IN_BYTE;
         // TV reductions use at most 5 KiB; its last 2 KiB hold dropout bits, separate from SWA masks.
         constexpr uint32_t DROP_UB_TENSOR_OFFSET = TV_UB_TENSOR_OFFSET + 6 * UB_UINT8_VECTOR_SIZE;
         // ALiBi uses TV's first 2 KiB before rowmax; LM would overlap live task GM slots.
@@ -1288,8 +1290,10 @@ public:
                 // EVENT_ID2 starts set; also wait for both unmasked P stores before mask conversion.
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
-                UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
-                UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
+                // CopyMaskGmToUb packs the causal corner at maskColumnRound;
+                // the visible score prefix has no mask data to convert.
+                UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, maskColumnRound);
+                UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, maskColumnRound);
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
